@@ -280,6 +280,8 @@ import_structure = {
     "phi3.configuration": ["Phi3Config"],
     "phi3.tokenizer": ["Phi3Tokenizer"],
     "phi3.modeling": ["Phi3Model", "Phi3ForCausalLM", "Phi3ForCausalLMPipe"],
+    "phi4.configuration": ["Phi4Config"],
+    "phi4.modeling": ["Phi4Model", "Phi4ForCausalLM"],
 }
 
 if TYPE_CHECKING:
