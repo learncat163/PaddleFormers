@@ -33,6 +33,53 @@ from ..model_utils import PretrainedModel, register_base_model
 from .configuration import Phi4Config
 
 
+def swiglu(x, y):
+    """
+    SwiGLU activation function: x * y * sigmoid(x)
+    Reference: https://arxiv.org/abs/2002.05202
+    """
+    return x * y * F.sigmoid(x)
+
+
+def selective_scan_paddle(x, dt, A, B, C, D, z=None, delta_bias=None, delta_softplus=True):
+    """
+    Pure PaddlePaddle implementation of selective scan (slow but functional)
+    x: (batch, d_inner, seq_len)
+    dt: (batch, d_inner, seq_len)
+    A: (d_inner, d_state)
+    B: (batch, d_state, seq_len)
+    C: (batch, d_state, seq_len)
+    D: (d_inner,)
+    z: (batch, d_inner, seq_len) optional for gating
+    """
+    batch, d_inner, seq_len = x.shape
+    _, d_state, _ = B.shape
+    
+    if delta_bias is not None:
+        dt = dt + delta_bias.reshape([1, -1, 1])
+    if delta_softplus:
+        dt = F.softplus(dt)
+    
+    dA = paddle.exp(paddle.einsum('bdn,dn->bdn', dt, A))
+    dB = paddle.einsum('bdn,bnt->bdnt', dt, B)
+    
+    state = paddle.zeros([batch, d_inner, d_state], dtype=x.dtype)
+    outputs = []
+    
+    for i in range(seq_len):
+        state = state * dA[:, :, i] + x[:, :, i:i+1] * dB[:, :, :, i]
+        y = paddle.einsum('bdn,bn->bd', state, C[:, :, i])
+        y = y + D * x[:, :, i]
+        outputs.append(y)
+    
+    y = paddle.stack(outputs, axis=2)
+    
+    if z is not None:
+        y = y * F.silu(z)
+    
+    return y
+
+
 class Phi4RMSNorm(nn.Layer):
     def __init__(self, hidden_size, eps=1e-5):
         super().__init__()
@@ -65,7 +112,10 @@ class Phi4MLP(nn.Layer):
     def forward(self, hidden_states):
         y = self.fc1(hidden_states)
         gate, y = paddle.chunk(y, 2, axis=-1)
-        y = y * self.activation_fn(gate)
+        if self.config.hidden_act == "silu":
+            y = swiglu(gate, y)
+        else:
+            y = y * self.activation_fn(gate)
         return self.fc2(y)
 
 class Phi4Attention(nn.Layer):
@@ -153,10 +203,13 @@ class Phi4Attention(nn.Layer):
         attn_weights = paddle.matmul(query_states, key_states.transpose([0, 1, 3, 2])) / math.sqrt(self.head_dim)
 
         if attention_mask is not None:
-            causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
+            if attention_mask.ndim == 4:
+                causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
+            else:
+                causal_mask = attention_mask
             attn_weights = attn_weights + causal_mask
 
-        attn_weights = F.softmax(attn_weights, axis=-1, dtype=paddle.float32).cast(query_states.dtype)
+        attn_weights = F.softmax(attn_weights, axis=-1, dtype="float32").cast(query_states.dtype)
         attn_weights = F.dropout(attn_weights, p=self.attention_dropout, training=self.training)
 
         attn_output = paddle.matmul(attn_weights, value_states)
@@ -169,13 +222,6 @@ class Phi4Attention(nn.Layer):
         return attn_output, attn_weights, yoco_key_values
 
 
-#//FIXME-ISPL: Mamba SSM layer requires porting from selective_scan_cuda and causal_conv1d
-# 未完成原因：需要移植 mamba-ssm 库的 CUDA kernels，包括：
-# 1. selective_scan_cuda: Mamba SSM 的核心算子，实现选择性扫描机制
-# 2. causal_conv1d_cuda: 优化的因果卷积算子
-# 3. selective_state_update: 增量解码的状态更新算子
-# 需要专业 CUDA/C++ 开发能力，预计开发周期数周。
-# 当前可通过设置 config.mb_per_layer=0 禁用 Mamba 层，使用纯 Attention 模式。
 class Phi4Mamba(nn.Layer):
     def __init__(
         self,
@@ -228,7 +274,7 @@ class Phi4Mamba(nn.Layer):
             A_log = paddle.log(A)
             self.A_log = paddle.create_parameter(
                 shape=A_log.shape,
-                dtype=str(A_log.dtype),
+                dtype='float32',
                 default_initializer=nn.initializer.Assign(A_log)
             )
 
@@ -244,8 +290,7 @@ class Phi4Mamba(nn.Layer):
         if self.yoco_cross:
             out = self.in_proj(hidden_states)
             if yoco_key_values is not None:
-                gate, y = yoco_key_values
-                out = y * self.act(gate)
+                out = swiglu(out, yoco_key_values)
             else:
                 out = out * self.act(out)
             out = self.out_proj(out)
@@ -265,9 +310,6 @@ class Phi4Mamba(nn.Layer):
 
         A = -paddle.exp(self.A_log.astype('float32'))
 
-        #//FIXME-ISPL: mamba_inner_fn requires selective_scan_cuda kernel
-        # 未完成原因：mamba_inner_fn 是融合了多个操作的高性能 kernel，需要移植 selective_scan_cuda。
-        # 当前使用 NotImplementedError 提示用户设置 mb_per_layer=0 禁用 Mamba。
         if (not self.yoco_kv) and self.use_fast_path and inference_params is None:
             raise NotImplementedError("Mamba fast path requires selective_scan_cuda kernel")
         else:
@@ -281,9 +323,6 @@ class Phi4Mamba(nn.Layer):
                 conv_state_update = F.pad(x, [self.d_conv - x.shape[-1], 0])
                 conv_state.set_value(conv_state_update)
 
-            #//FIXME-ISPL: causal_conv1d_fn requires causal_conv1d_cuda kernel
-            # 未完成原因：causal_conv1d_cuda 是优化的因果卷积 kernel，需要 C++/CUDA 实现。
-            # 当前使用 PaddlePaddle 原生 Conv1D 代替，功能正确但性能较差。
             x = self.act(self.conv1d(x)[..., :seqlen])
 
             if mask is not None:
@@ -299,24 +338,58 @@ class Phi4Mamba(nn.Layer):
             B = B.reshape([batch, seqlen, self.d_state]).transpose([0, 2, 1])
             C = C.reshape([batch, seqlen, self.d_state]).transpose([0, 2, 1])
 
-            #//FIXME-ISPL: selective_scan_fn requires selective_scan_cuda kernel
-            # 未完成原因：selective_scan 是 Mamba SSM 的核心算法，实现选择性状态空间模型。
-            # 需要从 mamba-ssm 库移植复杂的 CUDA kernel，涉及并行扫描算法和选择性门机制。
-            # 这是 Mamba 层无法工作的根本原因。
-            raise NotImplementedError(
-                "Mamba selective_scan_fn requires porting selective_scan_cuda kernel. "
-                "This is the core Mamba SSM operation requiring custom CUDA implementation."
+            y = selective_scan_paddle(
+                x, dt, A, B, C, self.D.astype('float32'),
+                z=None if self.yoco_kv else z,
+                delta_bias=self.dt_proj.bias.astype('float32') if self.dt_proj.bias is not None else None,
+                delta_softplus=True
             )
+            
+            y = y.transpose([0, 2, 1])
+            if self.yoco_kv:
+                yoco_key_values = y
+                y = swiglu(z.transpose([0, 2, 1]), y)
+            out = self.out_proj(y)
+        
+        return out, yoco_key_values
 
     def step(self, hidden_states, conv_state, ssm_state, yoco_key_values):
-        #//FIXME-ISPL: Incremental decoding requires causal_conv1d_update and selective_state_update kernels
-        # 未完成原因：增量解码需要两个优化 kernel：
-        # 1. causal_conv1d_update: 逐步更新卷积状态
-        # 2. selective_state_update: 逐步更新 SSM 状态
-        # 这些是推理阶段的性能优化，需要移植 mamba-ssm 库的 Triton/CUDA 实现。
-        raise NotImplementedError(
-            "Mamba incremental step requires causal_conv1d_update and selective_state_update CUDA kernels"
-        )
+        dtype = hidden_states.dtype
+        assert hidden_states.shape[1] == 1, "Only support decoding with 1 token at a time"
+        xz = self.in_proj(hidden_states.squeeze(1))
+        x, z = paddle.chunk(xz, 2, axis=-1)
+        
+        conv_state_new = paddle.roll(conv_state, shifts=-1, axis=-1)
+        conv_state_new[:, :, -1] = x
+        conv_state.set_value(conv_state_new)
+        
+        x_conv = paddle.sum(conv_state * self.conv1d.weight.squeeze(1), axis=-1)
+        if self.conv1d.bias is not None:
+            x_conv = x_conv + self.conv1d.bias
+        x = self.act(x_conv).astype(dtype)
+        
+        x_db = self.x_proj(x)
+        dt, B, C = paddle.split(x_db, [self.dt_rank, self.d_state, self.d_state], axis=-1)
+        dt = paddle.matmul(dt, self.dt_proj.weight.T)
+        A = -paddle.exp(self.A_log.astype('float32'))
+        
+        dt = F.softplus(dt + self.dt_proj.bias.astype(dt.dtype))
+        dA = paddle.exp(paddle.einsum('bd,dn->bdn', dt, A))
+        dB = paddle.einsum('bd,bn->bdn', dt, B)
+        ssm_state_new = ssm_state * dA + x.unsqueeze(2) * dB
+        ssm_state.set_value(ssm_state_new)
+        
+        y = paddle.einsum('bdn,bn->bd', ssm_state.astype(dtype), C)
+        y = y + self.D.astype(dtype) * x
+        
+        if self.yoco_kv:
+            yoco_key_values = y.unsqueeze(1)
+            y = swiglu(z, y)
+        else:
+            y = y * self.act(z)
+        
+        out = self.out_proj(y.unsqueeze(1))
+        return out, None, None, yoco_key_values
 
     def _get_states_from_cache(self, inference_params):
         conv_state = inference_params.key_cache[self.layer_idx]
@@ -325,13 +398,8 @@ class Phi4Mamba(nn.Layer):
 
 
 #//FIXME-ISPL: Full SambaY混合缓存机制需要适配（sliding window + global attention + mamba states）
-# 未完成原因：SambaY 模型使用复杂的混合缓存机制，需要实现：
-# 1. Sliding window cache: 滑动窗口 attention 的循环缓存
-# 2. Global attention cache: 特定层的全局缓存
-# 3. Mamba states cache: Mamba 层的 conv_state 和 ssm_state
-# 当前实现为基础 concat 缓存，能支持基本推理但缺少高级特性。
-# 需要深入理解 YOCO (You Only Cache Once) 机制和滑动窗口逻辑。
-class Phi4Cache(Cache):
+# 当前实现：使用纯 PaddlePaddle 实现混合缓存，包括 sliding window 和 Mamba states
+class Phi4Cache:
     def __init__(
         self,
         config: Phi4Config,
@@ -341,68 +409,70 @@ class Phi4Cache(Cache):
         dtype=None,
         max_batch_size: Optional[int] = None,
     ):
-        super().__init__()
-        self.dtype = dtype or paddle.get_default_dtype()
-        self.max_cache_len = max_cache_len
-        self.max_batch_size = batch_size or max_batch_size
+        self.dtype = dtype if dtype is not None else paddle.get_default_dtype()
+        self._max_cache_len = max_cache_len
+        self._max_batch_size = batch_size or max_batch_size
         self.head_dim = config.hidden_size // config.num_attention_heads
         self.num_key_value_heads = config.num_key_value_heads
         self.global_attn_idx = config.num_hidden_layers // 2 + 1
         self.num_layers = config.num_hidden_layers
         self.key_cache = []
         self.value_cache = []
+        self.config = config
         
-        #//FIXME-ISPL: 需要为不同层类型分配不同形状的cache (attention vs mamba)
-        # 未完成原因：Attention 层和 Mamba 层需要不同形状的缓存：
-        # - Attention: [batch, num_heads, seq_len, head_dim] 的 key/value cache
-        # - Mamba: [batch, d_inner, d_conv] 的 conv_state 和 [batch, d_inner, d_state] 的 ssm_state
-        # 当前简化处理，仅为 Attention 层分配缓存，Mamba 层返回 None。
         intermediate_size = config.mamba_expand * config.hidden_size
         ssm_state_size = config.mamba_d_state
         conv_kernel_size = config.mamba_d_conv
         self.conv_kernel_size = conv_kernel_size
         
         for layer_idx in range(config.num_hidden_layers):
-            if layer_idx % 2 == 0:
-                #//FIXME-ISPL: Mamba 层需要特殊的 conv_state 和 ssm_state
-                # 未完成原因：Mamba 层的缓存需要初始化：
-                # - conv_state: [batch, d_inner, d_conv] 用于卷积历史
-                # - ssm_state: [batch, d_inner, d_state] 用于 SSM 状态
-                # 当前返回 None，因为 Mamba forward 未实现。
+            use_mamba = config.mb_per_layer > 0 and layer_idx % config.mb_per_layer == 0
+            if use_mamba:
+                if self._max_batch_size is not None:
+                    conv_state = paddle.zeros([self._max_batch_size, intermediate_size, conv_kernel_size], dtype=self.dtype)
+                    ssm_state = paddle.zeros([self._max_batch_size, intermediate_size, ssm_state_size], dtype=self.dtype)
+                else:
+                    conv_state = None
+                    ssm_state = None
+                self.key_cache.append(conv_state)
+                self.value_cache.append(ssm_state)
+            else:
                 self.key_cache.append(None)
                 self.value_cache.append(None)
-            else:
-                self.key_cache.append([])
-                self.value_cache.append([])
+
+    @property
+    def max_batch_size(self):
+        return self._max_batch_size
+
+    @property
+    def max_batch_size(self):
+        return self._max_batch_size
 
     def update(self, key_states, value_states, layer_idx: int, cache_kwargs: Optional[Dict[str, Any]] = None):
         if layer_idx >= len(self.key_cache):
             raise ValueError(f"Layer index {layer_idx} out of range for cache with {len(self.key_cache)} layers")
         
-        if layer_idx % 2 == 0:
-            #//FIXME-ISPL: Mamba 层的缓存更新逻辑
-            # 未完成原因：Mamba 层的缓存更新需要特殊处理：
-            # - 不是简单的 concat，而是通过 conv_state 和 ssm_state 的逐步更新
-            # - 需要配合 Mamba forward 中的 step 方法
-            # 当前直接返回输入，不修改缓存。
+        use_mamba = self.config.mb_per_layer > 0 and layer_idx % self.config.mb_per_layer == 0
+        if use_mamba:
             return key_states, value_states
         
-        #//FIXME-ISPL: 需要实现滑动窗口缓存更新（除了global_attn_idx层）
-        # 未完成原因：滑动窗口缓存需要：
-        # 1. 检测当前层是否使用 sliding window (config.sliding_window[layer_idx])
-        # 2. 如果是，只保留最近的 window_size 个 token 的 cache
-        # 3. global_attn_idx 层例外，需要保存全部历史
-        # 当前使用简单的 concat 逻辑，未实现滑动窗口截断。
-        if isinstance(self.key_cache[layer_idx], list):
+        sliding_window = None
+        if (self.config.sliding_window is not None and 
+            layer_idx < len(self.config.sliding_window) and
+            self.config.sliding_window[layer_idx] is not None and
+            layer_idx != self.global_attn_idx):
+            sliding_window = self.config.sliding_window[layer_idx]
+        
+        if self.key_cache[layer_idx] is None:
             self.key_cache[layer_idx] = key_states
             self.value_cache[layer_idx] = value_states
         else:
-            if self.key_cache[layer_idx] is None:
-                self.key_cache[layer_idx] = key_states
-                self.value_cache[layer_idx] = value_states
-            else:
-                self.key_cache[layer_idx] = paddle.concat([self.key_cache[layer_idx], key_states], axis=2)
-                self.value_cache[layer_idx] = paddle.concat([self.value_cache[layer_idx], value_states], axis=2)
+            self.key_cache[layer_idx] = paddle.concat([self.key_cache[layer_idx], key_states], axis=2)
+            self.value_cache[layer_idx] = paddle.concat([self.value_cache[layer_idx], value_states], axis=2)
+            
+            if sliding_window is not None and self.key_cache[layer_idx].shape[2] > sliding_window:
+                self.key_cache[layer_idx] = self.key_cache[layer_idx][:, :, -sliding_window:, :]
+                self.value_cache[layer_idx] = self.value_cache[layer_idx][:, :, -sliding_window:, :]
         
         return self.key_cache[layer_idx], self.value_cache[layer_idx]
 
@@ -413,26 +483,24 @@ class Phi4Cache(Cache):
         if layer_idx >= len(self.key_cache):
             return 0
         
-        if self.key_cache[layer_idx] is None or (isinstance(self.key_cache[layer_idx], list) and len(self.key_cache[layer_idx]) == 0):
-            return 0
-        
-        if isinstance(self.key_cache[layer_idx], list):
+        if self.key_cache[layer_idx] is None:
             return 0
         
         return self.key_cache[layer_idx].shape[2]
 
     def get_max_cache_shape(self) -> Optional[int]:
-        return self.max_cache_len
+        return self._max_cache_len
 
     def reset(self):
         for layer_idx in range(len(self.key_cache)):
-            if self.key_cache[layer_idx] is not None:
-                if isinstance(self.key_cache[layer_idx], list):
-                    self.key_cache[layer_idx] = []
-                    self.value_cache[layer_idx] = []
-                elif hasattr(self.key_cache[layer_idx], 'zero_'):
+            use_mamba = self.config.mb_per_layer > 0 and layer_idx % self.config.mb_per_layer == 0
+            if use_mamba:
+                if self.key_cache[layer_idx] is not None:
                     self.key_cache[layer_idx].zero_()
                     self.value_cache[layer_idx].zero_()
+            else:
+                self.key_cache[layer_idx] = None
+                self.value_cache[layer_idx] = None
 
 
 class Phi4DecoderLayer(nn.Layer):
@@ -633,7 +701,7 @@ class Phi4Model(Phi4PretrainedModel):
                 config=self.config,
                 max_batch_size=batch_size,
                 max_cache_len=inputs_embeds.shape[1],
-                dtype=inputs_embeds.dtype,
+                dtype=str(inputs_embeds.dtype).replace('paddle.', ''),
             )
 
         if cache_position is None:

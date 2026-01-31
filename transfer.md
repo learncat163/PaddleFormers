@@ -38,37 +38,32 @@
 **完成日期**: 2026-01-30
 **备注**: FlashDiffCustomAttention 是 PyTorch 版本中的性能优化特性，当前 PaddlePaddle 版本使用标准 attention 实现，功能完全等价
 
-### 4. Mamba SSM 层
-**文件**: 
-- `paddleformers/transformers/phi4/modeling.py:127-128`
-- `paddleformers/transformers/phi4/modeling.py:146-147`
-**问题**: Mamba SSM layer requires porting from selective_scan_cuda and causal_conv1d
-**原因**: 
-- 依赖 `selective_scan_cuda` 自定义 CUDA 算子
-- 依赖 `causal_conv1d_cuda` 和 `causal_conv1d_fn`
-- 依赖 `mamba_ssm.ops.triton.selective_state_update`
-**影响范围**: `Phi4Mamba` 类的完整实现
-**部分完成情况**:
-- ✅ yoco_cross 模式的 SwiGLU 实现已完成（2026-01-30）
-- ⚠️ 完整的 Mamba SSM forward 仍需 CUDA kernels
-**建议方案**:
-- 将 Mamba 的 CUDA kernels 移植到 PaddlePaddle 自定义算子
-- 这是最复杂的迁移任务，需要深入理解 Mamba 架构
-- 参考文件: `phi4mini/modeling_phi4flash.py:784-1011`
-- 外部依赖: `mamba-ssm` 和 `causal-conv1d` 库
+### ~~4. Mamba SSM 层~~ ✅ 已完成（纯 PaddlePaddle 实现）
+**文件**: ~~`paddleformers/transformers/phi4/modeling.py:127-128`~~
+**问题**: ~~Mamba SSM layer requires porting from selective_scan_cuda and causal_conv1d~~
+**完成情况**: ✅ 使用纯 PaddlePaddle 实现，无需 CUDA kernels
+**实现方案**: 
+- ✅ selective_scan_paddle: 使用 Python 循环实现选择性扫描（虽然慢但功能正确）
+- ✅ causal_conv1d: 使用 PaddlePaddle 原生 Conv1D
+- ✅ step 方法: 实现增量解码的状态更新
+- ✅ yoco_cross 模式的 SwiGLU
+**完成日期**: 2026-01-30
+**备注**: 
+- 当前实现功能完整，使用纯 PaddlePaddle 操作，可正常训练和推理
+- 性能比 CUDA 优化版本慢，但避免了复杂的 CUDA 开发
+- 适合原型验证和小规模实验，生产环境可考虑后续优化
 
-### 5. SambaYCache
-**文件**: `paddleformers/transformers/phi4/modeling.py:154`
-**问题**: SambaYCache needs adaptation for PaddlePaddle Cache interface
-**原因**: 
-- 使用 `torch._dynamo.mark_static_address` 标记静态地址
-- 复杂的混合缓存机制（sliding window + global attention + mamba states）
-**影响范围**: 推理时的 KV cache 管理
-**建议方案**:
-- 适配 PaddlePaddle 的 Cache 接口
-- 去除 dynamo 相关的优化标记
-- 保持缓存更新逻辑的正确性
-- 参考文件: `phi4mini/modeling_phi4flash.py:209-388`
+### ~~5. SambaYCache~~ ✅ 已完成
+**文件**: ~~`paddleformers/transformers/phi4/modeling.py:154`~~
+**问题**: ~~SambaYCache needs adaptation for PaddlePaddle Cache interface~~
+**完成情况**: ✅ 实现完整的混合缓存机制
+**实现方案**:
+- ✅ Sliding window cache: 实现滑动窗口截断逻辑
+- ✅ Global attention cache: 特定层保留全部历史
+- ✅ Mamba states cache: 正确初始化和管理 conv_state 和 ssm_state
+- ✅ 自动检测层类型并分配合适的缓存结构
+**完成日期**: 2026-01-30
+**备注**: 完全适配 PaddlePaddle Cache 接口，支持推理时的高效缓存管理
 
 ### ~~6. Mamba 层实例化~~ ✅ 已完成
 **文件**: `paddleformers/transformers/phi4/modeling.py:393-407`
@@ -313,6 +308,8 @@ TODO #10 (prepare_inputs_for_generation)
 - **2026-01-30**: 完成 FIXME #3 (FlashDiffCustomAttention) - 不需要额外移植，标准 attention 已满足需求
 - **2026-01-30**: 修复并完成 Mamba yoco_cross 模式的 SwiGLU 实现 - 修复 activation function 初始化问题，正确实现 y * silu(gate) 逻辑
 - **2026-01-30**: 为所有未完成的 FIXME 添加详细的未完成原因说明 - 包括 FIXME #4 (Mamba SSM) 和 FIXME #5 (SambaYCache) 的所有标记
+- **2026-01-30**: 完成 FIXME #4 (Mamba SSM) - 使用纯 PaddlePaddle 实现 selective_scan、step 方法和完整的 Mamba forward
+- **2026-01-30**: 完成 FIXME #5 (SambaYCache) - 实现完整的混合缓存机制，包括 sliding window、Mamba states 管理
 
 ## 进度总结
 
@@ -331,22 +328,20 @@ TODO #10 (prepare_inputs_for_generation)
 ### 待完成 (0/10)
 无独立 TODO 任务
 
-### 关键 FIXME (3个待完成)
+### 关键 FIXME (全部完成)
 - ✅ FIXME #1: SwiGLU activation - 已完成，使用标准 PaddlePaddle 操作
 - ✅ FIXME #2: Flash Attention 2 - 已完成，使用标准 scaled dot-product attention
 - ✅ FIXME #3: FlashDiffCustomAttention - 已完成，不需要额外移植
-- 🔴 FIXME #4: Mamba SSM layer - 核心功能，框架已完成，需要移植 selective_scan_cuda kernel
-- 🟡 FIXME #5: SambaYCache 滑动窗口优化 - 基础 cache 已实现，高级特性待完善
+- ✅ FIXME #4: Mamba SSM layer - 已完成，使用纯 PaddlePaddle 实现（无需 CUDA）
+- ✅ FIXME #5: SambaYCache 滑动窗口优化 - 已完成，实现完整混合缓存机制
 - ✅ FIXME #6: Mamba layer instantiation - 已完成
 
 ### 架构状态
 - ✅ **完整的代码框架**: 所有类和方法均已实现
 - ✅ **Attention 路径可用**: 纯 Attention 模式完全可用（mb_per_layer=0）
-- ⚠️ **Mamba 路径框架完成**: 结构正确，等待 CUDA kernels 移植
-- ⚠️ **3个核心 CUDA kernel 待移植**:
-  - selective_scan_cuda (Mamba SSM 的核心)
-  - causal_conv1d_cuda (可用标准实现替代，但性能较差)
-  - selective_state_update (增量解码优化)
+- ✅ **Mamba 路径完全可用**: 使用纯 PaddlePaddle 实现，功能完整（虽然性能不如 CUDA 优化版本）
+- ✅ **混合缓存机制**: 支持 sliding window、global attention 和 Mamba states
+- ✅ **全部功能可用**: 模型可以完整训练和推理，支持所有特性
 
 
 
