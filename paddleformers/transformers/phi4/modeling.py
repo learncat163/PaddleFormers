@@ -310,7 +310,8 @@ class Phi4Mamba(nn.Layer):
 
         A = -paddle.exp(self.A_log.astype('float32'))
 
-        if (not self.yoco_kv) and self.use_fast_path and inference_params is None:
+        # Disable fast path if inference_params is None (use_cache=False) to avoid CUDA kernel requirement
+        if (not self.yoco_kv) and self.use_fast_path and (inference_params is not None):
             raise NotImplementedError("Mamba fast path requires selective_scan_cuda kernel")
         else:
             x, z = paddle.chunk(xz, 2, axis=1)
@@ -321,9 +322,11 @@ class Phi4Mamba(nn.Layer):
 
             if conv_state is not None:
                 conv_state_update = F.pad(x, [self.d_conv - x.shape[-1], 0])
-                conv_state.set_value(conv_state_update)
+                conv_state.set_value(conv_state_update.astype(conv_state.dtype))
 
-            x = self.act(self.conv1d(x)[..., :seqlen])
+            # Convert x to float32 for conv1d (weight is float32)
+            x_float32 = x.astype('float32')
+            x = self.act(self.conv1d(x_float32)[..., :seqlen]).astype(x.dtype)
 
             if mask is not None:
                 x = x * mask.unsqueeze(1)
@@ -619,6 +622,60 @@ class Phi4PretrainedModel(PretrainedModel):
     config_class = Phi4Config
     base_model_prefix = "model"
 
+    @classmethod
+    def _gen_aoa_config(cls, config: Phi4Config):
+        """Generate AOA (Array of Arrays) config for weight loading from HuggingFace format."""
+        model_prefix = "" if cls == cls.base_model_class else "model."
+
+        # Common mappings for all layers
+        aoa_statements = [
+            f"model.embed_tokens.weight -> {model_prefix}embed_tokens.weight",
+            f"model.final_layernorm.weight -> {model_prefix}final_layernorm.weight",
+            f"model.final_layernorm.bias -> {model_prefix}final_layernorm.bias",
+            f"model.layers.$LAYER_ID.input_layernorm.weight -> {model_prefix}layers.$LAYER_ID.input_layernorm.weight",
+            f"model.layers.$LAYER_ID.input_layernorm.bias -> {model_prefix}layers.$LAYER_ID.input_layernorm.bias",
+            f"model.layers.$LAYER_ID.post_attention_layernorm.weight -> {model_prefix}layers.$LAYER_ID.post_attention_layernorm.weight",
+            f"model.layers.$LAYER_ID.post_attention_layernorm.bias -> {model_prefix}layers.$LAYER_ID.post_attention_layernorm.bias",
+            f"model.layers.$LAYER_ID.mlp.fc1.weight^T -> {model_prefix}layers.$LAYER_ID.mlp.fc1.weight",
+            f"model.layers.$LAYER_ID.mlp.fc2.weight^T -> {model_prefix}layers.$LAYER_ID.mlp.fc2.weight",
+        ]
+
+        # Layer-specific mappings (Mamba vs Attention layers)
+        for layer_id in range(config.num_hidden_layers):
+            is_mamba_layer = (config.mb_per_layer > 0 and layer_id % config.mb_per_layer == 0)
+
+            if is_mamba_layer:
+                # Mamba layer mappings
+                aoa_statements.append(
+                    f"model.layers.{layer_id}.attn.in_proj.weight -> {model_prefix}layers.{layer_id}.attn.in_proj.weight"
+                )
+                aoa_statements.append(
+                    f"model.layers.{layer_id}.attn.out_proj.weight^T -> {model_prefix}layers.{layer_id}.attn.out_proj.weight"
+                )
+            else:
+                # Attention layer mappings (with Wqkv)
+                aoa_statements.append(
+                    f"model.layers.{layer_id}.attn.Wqkv.weight -> {model_prefix}layers.{layer_id}.attn.Wqkv.weight"
+                )
+                aoa_statements.append(
+                    f"model.layers.{layer_id}.attn.Wqkv.bias -> {model_prefix}layers.{layer_id}.attn.Wqkv.bias"
+                )
+                aoa_statements.append(
+                    f"model.layers.{layer_id}.attn.out_proj.weight^T -> {model_prefix}layers.{layer_id}.attn.out_proj.weight"
+                )
+                aoa_statements.append(
+                    f"model.layers.{layer_id}.attn.out_proj.bias -> {model_prefix}layers.{layer_id}.attn.out_proj.bias"
+                )
+
+        # For Phi4ForCausalLM (not Phi4Model), handle lm_head
+        if cls != cls.base_model_class:
+            if config.tie_word_embeddings:
+                aoa_statements.append("model.embed_tokens.weight -> lm_head.weight")
+            else:
+                aoa_statements.append("lm_head.weight -> lm_head.weight")
+
+        return {"aoa_statements": aoa_statements}
+
     def _init_weights(self, layer):
         std = self.config.initializer_range
         if isinstance(layer, nn.Linear):
@@ -715,12 +772,15 @@ class Phi4Model(Phi4PretrainedModel):
             )
 
         if attention_mask is not None and use_cache and not self.training:
-            is_padding_right = attention_mask[:, -1].sum().item() != batch_size
-            if is_padding_right:
-                raise ValueError(
-                    "You are attempting to perform batched generation with padding_side='right'"
-                    " this may lead to unexpected behaviour for Flash Attention version of Phi4."
-                )
+            # Only check for padding_right if seq_len > 1 (for single token inputs, padding direction doesn't matter)
+            seq_len = attention_mask.shape[1]
+            if seq_len > 1:
+                is_padding_right = attention_mask[:, -1].sum().item() != batch_size
+                if is_padding_right:
+                    raise ValueError(
+                        "You are attempting to perform batched generation with padding_side='right'"
+                        " this may lead to unexpected behaviour for Flash Attention version of Phi4."
+                    )
 
         hidden_states = inputs_embeds
 
