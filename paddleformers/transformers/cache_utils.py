@@ -519,6 +519,24 @@ class DynamicCache(Cache):
         for layer in self.layers:
             yield layer.keys, layer.values, getattr(layer, "_sliding_window_tensor", None)
 
+    @classmethod
+    def from_legacy_cache(cls, past_key_values=None) -> "DynamicCache":
+        """Converts a legacy cache (tuple of tuples) into a DynamicCache instance."""
+        cache = cls()
+        if past_key_values is not None:
+            for layer_idx in range(len(past_key_values)):
+                key_states, value_states = past_key_values[layer_idx]
+                cache.update(key_states, value_states, layer_idx)
+        return cache
+
+    def to_legacy_cache(self):
+        """Converts this DynamicCache instance back to the legacy tuple-of-tuples format."""
+        legacy = ()
+        for layer in self.layers:
+            if layer.keys is not None:
+                legacy += ((layer.keys, layer.values),)
+        return legacy if legacy else None
+
 
 class DynamicSlidingWindowLayer(DynamicLayer):
     """
