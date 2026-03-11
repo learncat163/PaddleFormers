@@ -170,3 +170,7 @@ ops/csrc/fp8/deep_gemm/include/cute
 # logs and running results
 paddleformers_dist_log
 checkpoints
+*.pdparams
+/.claude/
+AGENTS.md
+/tmp/
