@@ -344,5 +344,116 @@ class InternLM25CompatibilityTest(unittest.TestCase):
         )
 
 
+class InternLM25ConvertedWeightTest(unittest.TestCase):
+    """Test the converted weights from HuggingFace model."""
+
+    def setUp(self):
+        # Get the project root directory and construct the model path
+        import os
+        # From tests/transformers/intern_lm2_5/test_modeling.py go to project root (4 levels up)
+        # tests/transformers/intern_lm2_5/test_modeling.py -> tests/transformers/intern_lm2_5 -> tests/transformers -> tests -> project_root
+        current_file = os.path.abspath(__file__)
+        project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(current_file))))
+        # Construct model path
+        self.model_path = os.path.join(project_root, "tmp", "internlm25_paddle_model")
+
+    def test_model_loading(self):
+        """Test loading the converted model."""
+        model = InternLM25ForCausalLM.from_pretrained(self.model_path, load_checkpoint_format="")
+        self.assertIsNotNone(model)
+        model.eval()
+
+    def test_model_inference(self):
+        """Test basic inference with the converted model."""
+        model = InternLM25ForCausalLM.from_pretrained(self.model_path, load_checkpoint_format="")
+        model.eval()
+
+        # Prepare input
+        input_ids = paddle.to_tensor([[1, 345, 232, 328, 740, 140, 1695, 69, 6078, 1588]])
+        attention_mask = paddle.to_tensor([[1, 1, 1, 1, 1, 1, 1, 1, 1, 1]])
+
+        with paddle.no_grad():
+            outputs = model(input_ids=input_ids, attention_mask=attention_mask, return_dict=True)
+
+        logits = outputs.logits
+        self.assertEqual(logits.shape[0], 1)  # batch_size
+        self.assertEqual(logits.shape[1], 10)  # seq_length
+        self.assertIsNotNone(logits)
+
+    def test_model_generation(self):
+        """Test text generation with the converted model."""
+        model = InternLM25ForCausalLM.from_pretrained(self.model_path, load_checkpoint_format="")
+        tokenizer = InternLM25Tokenizer.from_pretrained(self.model_path, load_checkpoint_format="")
+        model.eval()
+
+        prompt = "Hello, how are you?"
+        inputs = tokenizer(prompt, return_tensors="pd")
+        input_ids = inputs["input_ids"]
+
+        with paddle.no_grad():
+            generated_ids = model.generate(
+                input_ids=input_ids,
+                max_new_tokens=20,
+                use_cache=True,
+                decode_strategy="greedy_search",
+            )
+
+        # Extract from tuple if needed
+        if isinstance(generated_ids, tuple):
+            generated_ids = generated_ids[0]
+
+        # Verify generation worked
+        self.assertIsNotNone(generated_ids)
+        self.assertGreater(generated_ids.shape[1], input_ids.shape[1])
+
+        # Decode the output
+        decoded = tokenizer.decode(generated_ids[0].numpy().tolist(), skip_special_tokens=True)
+        self.assertGreater(len(decoded.strip()), 0)
+
+    def test_chinese_generation(self):
+        """Test Chinese text generation with the converted model using chat mode."""
+        model = InternLM25ForCausalLM.from_pretrained(self.model_path, load_checkpoint_format="")
+        tokenizer = InternLM25Tokenizer.from_pretrained(self.model_path, load_checkpoint_format="")
+        device = "gpu"
+        model.eval()
+
+        prompt = "猫和狗的区别是什么？"
+
+        # Use chat mode for better output
+        chat_inputs = model.build_inputs(
+            tokenizer, prompt, history=[], meta_instruction="You are a helpful assistant."
+        )
+        input_ids = chat_inputs["input_ids"].to(device)
+        attention_mask = chat_inputs.get("attention_mask")
+        if attention_mask is not None:
+            attention_mask = attention_mask.to(device)
+
+        with paddle.no_grad():
+            out = model.generate(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                max_new_tokens=256,
+                use_cache=True,
+                decode_strategy="greedy_search",
+            )
+
+        # Extract from tuple if needed
+        seq = out[0] if isinstance(out, (list, tuple)) else out
+        token_ids = seq.numpy().tolist()[0]
+
+        # Decode the output
+        decoded = tokenizer.decode(token_ids, skip_special_tokens=True)
+
+        # Print the result for observation
+        print("\n" + "=" * 80)
+        print("Chinese Generation Test (Chat Mode)")
+        print("=" * 80)
+        print(f"Prompt: {prompt}")
+        print(f"Generated: {decoded}")
+        print("=" * 80 + "\n")
+
+        self.assertGreater(len(decoded.strip()), 0)
+
+
 if __name__ == "__main__":
     unittest.main()
