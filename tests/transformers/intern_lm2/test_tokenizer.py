@@ -16,7 +16,7 @@ import os
 import tempfile
 import unittest
 
-from paddleformers.transformers.intern_lm2.tokenizer import InternLM2Tokenizer
+from paddleformers.transformers.intern_lm2_not_work.tokenizer import InternLM2Tokenizer
 
 model_path = "learncat/internlm2_tiny_paddle"
 

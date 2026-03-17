@@ -24,30 +24,15 @@ except ImportError:
     spm = None
 
 from paddleformers.transformers.tokenizer_utils import PretrainedTokenizer
-from paddleformers.transformers.tokenizer_utils_base import TextInput
 from paddleformers.utils.log import logger
 
 
 VOCAB_FILES_NAMES = {"vocab_file": "tokenizer.model"}
 
-PRETRAINED_VOCAB_FILES_MAP = {
-    "vocab_file": {
-        "internlm/internlm2_5-7b": "https://huggingface.co/internlm/internlm2_5-7b/resolve/main/tokenizer.model",
-    }
-}
 
 
 class InternLM25Tokenizer(PretrainedTokenizer):
-    """
-    Construct a InternLM2.5 tokenizer. Based on byte-level Byte-Pair-Encoding.
-
-    Args:
-        vocab_file (`str`):
-            Path to the vocabulary file.
-    """
-
     resource_files_names = VOCAB_FILES_NAMES
-    pretrained_resource_files_map = PRETRAINED_VOCAB_FILES_MAP
     model_input_names = ["input_ids", "attention_mask"]
 
     def __init__(
@@ -95,25 +80,20 @@ class InternLM25Tokenizer(PretrainedTokenizer):
 
     @property
     def vocab_size(self):
-        """Returns vocab size"""
         return self.sp_model.get_piece_size()
 
     def get_vocab(self):
-        """Returns vocab as a dict"""
         vocab = {self.convert_ids_to_tokens(i): i for i in range(self.vocab_size)}
         vocab.update(self.added_tokens_encoder)
         return vocab
 
     def _tokenize(self, text):
-        """Returns a tokenized string."""
         return self.sp_model.encode(text, out_type=str)
 
     def _convert_token_to_id(self, token):
-        """Converts a token (str) in an id using the vocab."""
         return self.sp_model.piece_to_id(token)
 
     def _convert_id_to_token(self, index):
-        """Converts an index (integer) in a token (str) using the vocab."""
         token = self.sp_model.IdToPiece(index)
         return token
 
@@ -124,12 +104,10 @@ class InternLM25Tokenizer(PretrainedTokenizer):
             return decoded
 
     def convert_tokens_to_string(self, tokens):
-        """Converts a sequence of tokens (string) in a single string."""
         current_sub_tokens = []
         out_string = ""
         prev_is_special = False
         for token in tokens:
-            # make sure that special tokens are not decoded using sentencepiece model
             if token in self.all_special_tokens:
                 if not prev_is_special:
                     out_string += " "
@@ -145,16 +123,6 @@ class InternLM25Tokenizer(PretrainedTokenizer):
         return out_string[1:]
 
     def save_vocabulary(self, save_directory, filename_prefix: Optional[str] = None) -> Tuple[str]:
-        """
-        Save the vocabulary and special tokens file to a directory.
-
-        Args:
-            save_directory (`str`):
-                The directory in which to save the vocabulary.
-
-        Returns:
-            `Tuple(str)`: Paths to the files saved.
-        """
         if not os.path.isdir(save_directory):
             logger.error(f"Vocabulary path ({save_directory}) should be a directory")
             return
@@ -190,21 +158,6 @@ class InternLM25Tokenizer(PretrainedTokenizer):
     def get_special_tokens_mask(
         self, token_ids_0: List[int], token_ids_1: Optional[List[int]] = None, already_has_special_tokens: bool = False
     ) -> List[int]:
-        """
-        Retrieve sequence ids from a token list that has no special tokens added. This method is called when adding
-        special tokens using the tokenizer `prepare_for_model` method.
-
-        Args:
-            token_ids_0 (`List[int]`):
-                List of IDs.
-            token_ids_1 (`List[int]`, *optional*):
-                Optional second list of IDs for sequence pairs.
-            already_has_special_tokens (`bool`, *optional*, defaults to `False`):
-                Whether or not the token list is already formatted with special tokens for the model.
-
-        Returns:
-            `List[int]`: A list of integers in the range [0, 1]: 1 for a special token, 0 for a sequence token.
-        """
         if already_has_special_tokens:
             return super().get_special_tokens_mask(
                 token_ids_0=token_ids_0, token_ids_1=token_ids_1, already_has_special_tokens=True
@@ -217,19 +170,6 @@ class InternLM25Tokenizer(PretrainedTokenizer):
     def create_token_type_ids_from_sequences(
         self, token_ids_0: List[int], token_ids_1: Optional[List[int]] = None
     ) -> List[int]:
-        """
-        Create a mask from the two sequences passed to be used in a sequence-pair classification task. T5 does not make
-        use of token type ids, therefore a list of zeros is returned.
-
-        Args:
-            token_ids_0 (`List[int]`):
-                List of IDs.
-            token_ids_1 (`List[int]`, *optional*):
-                Optional second list of IDs for sequence pairs.
-
-        Returns:
-            `List[int]`: List of zeros.
-        """
         eos = [self.eos_token_id]
 
         if token_ids_1 is None:

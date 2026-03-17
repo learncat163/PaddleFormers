@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import os
+import sys
 import tempfile
 import unittest
 
@@ -26,8 +27,8 @@ from paddleformers.transformers import (
     InternLM25ForCausalLM,
     InternLM25Tokenizer,
 )
+from paddleformers.transformers.model_utils import load_sharded_checkpoint
 from tests.testing_utils import require_package, slow
-
 
 class TestInternLM25Config(unittest.TestCase):
     def test_config_initialization(self):
@@ -355,7 +356,15 @@ class InternLM25ConvertedWeightTest(unittest.TestCase):
         current_file = os.path.abspath(__file__)
         project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(current_file))))
         # Construct model path
-        self.model_path = os.path.join(project_root, "tmp", "internlm25_paddle_model")
+        self.model_path = "/home/cao/code/github/PaddleFormers/tmp/internlm25_paddle_model"
+
+        # Save original dtype and set to bfloat16 for tests
+        self._original_dtype = paddle.get_default_dtype()
+        paddle.set_default_dtype("bfloat16")
+
+    def tearDown(self):
+        # Restore original dtype
+        paddle.set_default_dtype(self._original_dtype)
 
     def test_model_loading(self):
         """Test loading the converted model."""
@@ -410,39 +419,38 @@ class InternLM25ConvertedWeightTest(unittest.TestCase):
         decoded = tokenizer.decode(generated_ids[0].numpy().tolist(), skip_special_tokens=True)
         self.assertGreater(len(decoded.strip()), 0)
 
+    #@slow
     def test_chinese_generation(self):
         """Test Chinese text generation with the converted model using chat mode."""
-        model = InternLM25ForCausalLM.from_pretrained(self.model_path, load_checkpoint_format="")
-        tokenizer = InternLM25Tokenizer.from_pretrained(self.model_path, load_checkpoint_format="")
-        device = "gpu"
+        paddle.set_device("gpu")
+
+        config = InternLM25Config.from_pretrained(self.model_path)
+        model = InternLM25ForCausalLM(config)
+        
+        load_sharded_checkpoint(model, self.model_path, strict=False, prefer_safe=False)
         model.eval()
 
-        prompt = "猫和狗的区别是什么？"
+        tokenizer = InternLM25Tokenizer.from_pretrained(self.model_path, load_checkpoint_format="")
 
-        # Use chat mode for better output
+        prompt = "猫和狗的区别是什么?列出最主要的3点"
+        # 如果不专门设置提示词，有概率输出markdown格式的python代码
         chat_inputs = model.build_inputs(
-            tokenizer, prompt, history=[], meta_instruction="You are a helpful assistant."
+            tokenizer, prompt, history=[], meta_instruction="You are a helpful assistant.don't print markdown code"
         )
-        input_ids = chat_inputs["input_ids"].to(device)
-        attention_mask = chat_inputs.get("attention_mask")
-        if attention_mask is not None:
-            attention_mask = attention_mask.to(device)
 
         with paddle.no_grad():
             out = model.generate(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                max_new_tokens=256,
-                use_cache=True,
+                input_ids=chat_inputs["input_ids"],
+                attention_mask=chat_inputs.get("attention_mask"),
+                max_new_tokens=512,
+                use_cache=False,
                 decode_strategy="greedy_search",
             )
 
-        # Extract from tuple if needed
         seq = out[0] if isinstance(out, (list, tuple)) else out
-        token_ids = seq.numpy().tolist()[0]
 
         # Decode the output
-        decoded = tokenizer.decode(token_ids, skip_special_tokens=True)
+        decoded = tokenizer.decode(seq.numpy().tolist()[0], skip_special_tokens=True)
 
         # Print the result for observation
         print("\n" + "=" * 80)

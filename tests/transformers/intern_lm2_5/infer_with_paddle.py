@@ -27,6 +27,7 @@ from paddleformers.transformers.intern_lm2_5 import (
     InternLM25ForCausalLM,
     InternLM25Tokenizer,
 )
+from paddleformers.transformers.model_utils import load_sharded_checkpoint
 
 
 def main():
@@ -39,7 +40,8 @@ def main():
 
     config = InternLM25Config.from_pretrained(model_path)
     model = InternLM25ForCausalLM(config)
-    model.set_state_dict(paddle.load(os.path.join(model_path, "model_state.pdparams")))
+    
+    load_sharded_checkpoint(model, model_path, strict=False, prefer_safe=False)
     model.eval()
 
     tokenizer = InternLM25Tokenizer.from_pretrained(model_path, load_checkpoint_format="")
