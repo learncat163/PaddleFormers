@@ -88,6 +88,7 @@ class Template:
             prompt_ids += encoded_ids
 
         response_ids = encoded_messages[-1]
+        ####logger.info(f"Prompt length: {len(prompt_ids)}, Response length: {len(response_ids)}")
         return prompt_ids, response_ids
 
     def encode_multiturn(
@@ -131,6 +132,7 @@ class Template:
             else:
                 raise ValueError(f"Input must be string, set[str] or dict[str, str], got {type(elem)}")
 
+        ####logger.info(f"Converted elements to token_ids: {len(token_ids)} tokens")
         return token_ids
 
     def _encode(
@@ -176,6 +178,9 @@ class Template:
                     elements += [self.chat_sep]
             else:
                 raise NotImplementedError("Unexpected role: {}".format(message["role"]))
+
+            # Log elements for debugging
+            ####logger.info(f"Turn {i}, role: {message.get('role')}, elements: {elements}")
 
             encoded_messages.append(self._convert_elements_to_ids(tokenizer, elements))
 
@@ -884,4 +889,15 @@ register_template(
     format_prefix=EmptyFormatter(slots=["[gMASK]<sop>"]),
     chat_sep="<|assistant|>\n",
     mm_plugin=get_mm_plugin(name="glm_ocr", image_token="<|image|>"),
+)
+
+register_template(
+    name="internlm2_5",
+    format_user=StringFormatter(slots=["<|im_start|>user\n{{content}}<|im_end|>\n<|im_start|>assistant\n"]),
+    format_assistant=StringFormatter(slots=["{{content}}<|im_end|>\n"]),
+    format_system=StringFormatter(slots=["<|im_start|>system\n{{content}}<|im_end|>\n"]),
+    format_prefix=EmptyFormatter(slots=["<s>"]),
+    chat_sep="<|im_end|>\n",
+    suffix=["<|im_end|>\n"],
+    enable_thinking=None,
 )

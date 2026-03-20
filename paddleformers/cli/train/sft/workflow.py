@@ -708,8 +708,8 @@ def run_sft(
             total_tokens_per_second_per_gpu = (
                 total_tokens / train_result.metrics["train_runtime"] / training_args.world_size
             )
-            logger.info(f"Total_Tokens_per_second_per_gpu: {total_tokens_per_second_per_gpu} ")
-            logger.info("Benchmark done.")
+            ####logger.info(f"Total_Tokens_per_second_per_gpu: {total_tokens_per_second_per_gpu} ")
+            ####logger.info("Benchmark done.")
         else:
             if not training_args.autotuner_benchmark:
                 trainer.save_model(

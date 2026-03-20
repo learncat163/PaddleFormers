@@ -377,9 +377,45 @@ class SFTTrainer(Trainer):
 
     def log(self, logs: Dict[str, float], **kwargs) -> None:
         if "loss" in logs:
-            logs["ppl"] = np.exp(logs["loss"])
+            loss_val = logs["loss"]
+            # Check if loss is a tensor and convert to float if needed
+            if hasattr(loss_val, 'item'):
+                loss_val = loss_val.item()
+            elif hasattr(loss_val, 'numpy'):
+                loss_val = float(loss_val.numpy())
+
+            # Check for nan or inf
+            if np.isnan(loss_val):
+                logger.error(f"Loss is NaN! Setting ppl to NaN")
+                logs["ppl"] = float("nan")
+            elif np.isinf(loss_val):
+                logger.error(f"Loss is Inf! Setting ppl to Inf")
+                logs["ppl"] = float("inf")
+            elif loss_val > 709:  # exp(709) is near float64 max
+                logger.warning(f"Loss {loss_val} too large for exp, setting ppl to inf")
+                logs["ppl"] = float("inf")
+            else:
+                logs["ppl"] = np.exp(loss_val)
         if "eval_loss" in logs:
-            logs["eval_ppl"] = np.exp(logs["eval_loss"])
+            eval_loss_val = logs["eval_loss"]
+            # Check if eval_loss is a tensor and convert to float if needed
+            if hasattr(eval_loss_val, 'item'):
+                eval_loss_val = eval_loss_val.item()
+            elif hasattr(eval_loss_val, 'numpy'):
+                eval_loss_val = float(eval_loss_val.numpy())
+
+            # Check for nan or inf
+            if np.isnan(eval_loss_val):
+                logger.error(f"Eval_loss is NaN! Setting eval_ppl to NaN")
+                logs["eval_ppl"] = float("nan")
+            elif np.isinf(eval_loss_val):
+                logger.error(f"Eval_loss is Inf! Setting eval_ppl to Inf")
+                logs["eval_ppl"] = float("inf")
+            elif eval_loss_val > 709:
+                logger.warning(f"Eval_loss {eval_loss_val} too large for exp, setting eval_ppl to inf")
+                logs["eval_ppl"] = float("inf")
+            else:
+                logs["eval_ppl"] = np.exp(eval_loss_val)
 
         super(SFTTrainer, self).log(logs, **kwargs)
 

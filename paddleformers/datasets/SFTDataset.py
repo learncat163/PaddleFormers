@@ -800,6 +800,10 @@ class SFTDataSet(IterableDataset):
 
         assert len(tokens) == len(labels), f"{len(tokens)}-{len(labels)}"
 
+        # Log basic info for debugging
+        total_labels = sum(1 for l in labels if l != -100)
+        ####logger.info(f"Total tokens: {len(tokens)}, trainable labels: {total_labels}")
+
         if self.enable_dataset_debug:
             logger.info("\n" + "=" * 50)
             logger.info("[dataset debug] Debug mode enabled")

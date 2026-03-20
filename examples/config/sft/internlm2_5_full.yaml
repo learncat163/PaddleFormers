@@ -1,0 +1,63 @@
+### data
+train_dataset_type: erniekit
+eval_dataset_type: erniekit
+train_dataset_path: ./tmp/gsm8k/train.jsonl
+train_dataset_prob: "1.0"
+eval_dataset_path: ./tmp/gsm8k/test.jsonl
+eval_dataset_prob: "1.0"
+max_seq_len: 2048
+packing: false
+dataloader_shuffle: false
+mix_strategy: concat
+template_backend: custom
+template: internlm2_5
+### model
+# placeholder path; override via update_training_args in test or CLI --model_name_or_path
+model_name_or_path: /home/cao/llm/internlm/internlm2_5-1_8b-chat-paddle-fixed
+_attn_implementation: flashmask
+convert_from_hf: false
+trust_remote_code: false
+lora: true
+lora_rank: 8
+
+
+### finetuning
+# base
+stage: SFT
+fine_tuning: lora
+seed: 23
+do_train: true
+do_eval: true
+fp16: false
+bf16: true
+per_device_eval_batch_size: 1
+per_device_train_batch_size: 4
+num_train_epochs: 3
+max_steps: -1
+eval_steps: 1000
+evaluation_strategy: steps
+save_strategy: steps
+logging_steps: 1
+gradient_accumulation_steps: 4
+logging_dir: ./vdl_log
+output_dir: ./checkpoints/internlm2_5-sft-full-v2
+disable_tqdm: true
+eval_accumulation_steps: 16
+# train
+warmup_steps: 50
+learning_rate: 1.0e-5
+
+# performance
+tensor_model_parallel_size: 1
+pipeline_model_parallel_size: 1
+sharding: stage1
+recompute_granularity: null
+recompute_method: uniform
+recompute_num_layers: 1
+bf16: true
+fp16_opt_level: O1
+unified_checkpoint: true
+# 注释之后跳过保存阶段
+# save_checkpoint_format: flex_checkpoint
+load_checkpoint_format: sharding_io
+continue_training: false

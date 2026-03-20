@@ -74,6 +74,9 @@ MAPPING_NAMES = OrderedDict(
         ("Gemma3", "gemma3_text"),
         ("Glm4vMoe", "glm4v_moe"),
         ("GlmOcr", "glm_ocr"),
+        # InternLM2.5: architectures=["InternLM2ForCausalLM"] -> module intern_lm2_5
+        # original config.json: {"architectures": ["InternLM2ForCausalLM"], "model_type": "internlm2_5"}
+        ("InternLM2", "intern_lm2_5"),
     ]
 )
 

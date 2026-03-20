@@ -21,6 +21,7 @@ import paddle
 from scipy.linalg import block_diag
 
 from paddleformers.peft.lora import LoRAModel
+from paddleformers.utils.log import logger
 
 from .SFTDataset import Sequence
 
@@ -467,6 +468,8 @@ def collate_fn(
     if padding_free:
         batch = [sum(batch, [])]
         max_seq_len = sum(len(item.token_ids) for sequence in batch for item in sequence)
+    ####logger.info(f"Collating batch with {len(batch)} sequences, max_seq_len: {max_seq_len}")
+
     if not max_seq_len:
         max_seq_len = max(sum(len(item.token_ids) for item in sequence) for sequence in batch)
     max_seq_len = calc_padding_size(max_seq_len, training_args)

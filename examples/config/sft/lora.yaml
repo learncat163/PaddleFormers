@@ -27,13 +27,13 @@ do_eval: true
 per_device_eval_batch_size: 1
 per_device_train_batch_size: 1
 num_train_epochs: 1
-max_steps: -1
+max_steps: 10000
 eval_steps: 100
 evaluation_strategy: steps
-save_steps: 100
+save_steps: 100000
 save_strategy: steps
 logging_steps: 1
-gradient_accumulation_steps: 4
+gradient_accumulation_steps: 1
 logging_dir: ./vdl_log
 output_dir: ./checkpoints/qwen3-sft-lora
 disable_tqdm: true
