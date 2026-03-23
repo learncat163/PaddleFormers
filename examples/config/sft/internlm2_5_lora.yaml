@@ -5,7 +5,7 @@ train_dataset_path: ./tests/fixtures/dummy/sft/train.jsonl
 train_dataset_prob: "1.0"
 eval_dataset_path: ./tests/fixtures/dummy/sft/eval.jsonl
 eval_dataset_prob: "1.0"
-max_seq_len: 8192
+max_seq_len: 2048
 packing: false
 dataloader_shuffle: false
 mix_strategy: concat
@@ -16,31 +16,35 @@ template: internlm2_5
 #model_name_or_path: Qwen/Qwen3-0.6B-Base
 model_name_or_path: /mnt/caoyuanye/llm/internlm/internlm2_5-1_8b-chat-paddle
 _attn_implementation: flashmask
+convert_from_hf: false
+trust_remote_code: false
+lora: true
+lora_rank: 8
 
 
 ### finetuning
 # base
 stage: SFT
-fine_tuning: full
+fine_tuning: lora
 seed: 23
 do_train: true
 do_eval: true
+fp16: false
+bf16: true
 per_device_eval_batch_size: 1
-per_device_train_batch_size: 1
+per_device_train_batch_size: 4
 num_train_epochs: 1
-max_steps: 1000
+max_steps: 10000
 eval_steps: 100
 evaluation_strategy: steps
-save_steps: 100000
 save_strategy: steps
+save_steps: 100000
 logging_steps: 1
-gradient_accumulation_steps: 1
+gradient_accumulation_steps: 4
 logging_dir: ./vdl_log
-output_dir: ./checkpoints/qwen3-sft-full
+output_dir: ./checkpoints/internlm2_5-sft-full-v2
 disable_tqdm: true
 eval_accumulation_steps: 16
-
-
 # train
 warmup_steps: 20
 learning_rate: 1.0e-5
@@ -49,12 +53,12 @@ learning_rate: 1.0e-5
 tensor_model_parallel_size: 1
 pipeline_model_parallel_size: 1
 sharding: stage1
-recompute_granularity: full
+recompute_granularity: null
 recompute_method: uniform
 recompute_num_layers: 1
 bf16: true
 fp16_opt_level: O1
-unified_checkpoint: false
+unified_checkpoint: true
 # 注释之后跳过保存阶段
 # save_checkpoint_format: flex_checkpoint
 load_checkpoint_format: sharding_io
