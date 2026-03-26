@@ -1,3 +1,4 @@
+
 # Copyright (c) 2025 PaddlePaddle Authors. All Rights Reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -920,4 +921,14 @@ register_template(
     format_prefix=EmptyFormatter(slots=["[gMASK]<sop>"]),
     chat_sep="<|assistant|>\n",
     mm_plugin=get_mm_plugin(name="glm_ocr", image_token="<|image|>"),
+)
+
+register_template(
+    name="internlm3",
+    format_user=StringFormatter(slots=["<|im_start|>user\n{{content}}<|im_end|>\n<|im_start|>assistant\n"]),
+    format_assistant=StringFormatter(slots=["{{content}}<|im_end|>\n"]),
+    format_system=StringFormatter(slots=["<|im_start|>system\n{{content}}<|im_end|>\n"]),
+    format_prefix=EmptyFormatter(slots=["<s>"]),
+    chat_sep="<|im_end|>\n",
+    suffix=["<|im_end|>\n"],
 )
