@@ -138,26 +138,26 @@ class InternLM3Config(PretrainedConfig):
     }
 
     def __init__(
-        self,
-        vocab_size=128512,
-        hidden_size=4096,
-        intermediate_size=11008,
-        num_hidden_layers=32,
-        num_attention_heads=32,
-        num_key_value_heads=32,
-        hidden_act="silu",
-        max_position_embeddings=32768,
-        initializer_range=0.02,
-        rms_norm_eps=1e-6,
-        use_cache=True,
-        tie_word_embeddings=False,
-        rope_theta=10000.0,
-        rope_scaling=None,
-        qkv_bias=False,
-        attention_dropout=0.0,
-        bias=False,
-        head_dim=None,
-        **kwargs,
+            self,
+            vocab_size=128512,
+            hidden_size=4096,
+            intermediate_size=11008,
+            num_hidden_layers=32,
+            num_attention_heads=32,
+            num_key_value_heads=32,
+            hidden_act="silu",
+            max_position_embeddings=32768,
+            initializer_range=0.02,
+            rms_norm_eps=1e-6,
+            use_cache=True,
+            tie_word_embeddings=False,
+            rope_theta=10000.0,
+            rope_scaling=None,
+            qkv_bias=False,
+            attention_dropout=0.0,
+            bias=False,
+            head_dim=None,
+            **kwargs,
     ):
         self.vocab_size = vocab_size
         self.max_position_embeddings = max_position_embeddings
@@ -181,13 +181,8 @@ class InternLM3Config(PretrainedConfig):
         self.attention_dropout = attention_dropout
         self.bias = bias
         self.head_dim = head_dim if head_dim is not None else self.hidden_size // self.num_attention_heads
-        # validate the correctness of rotary position embeddings parameters
-        # BC: if there is 'type' field, move it to 'rope_type'
         if self.rope_scaling is not None and "type" in self.rope_scaling:
             self.rope_scaling["rope_type"] = self.rope_scaling["type"]
-        # 将 rope_scaling 转换为 rope_parameters 格式，以便 standardize_rope_params 能够读取
-        # 原始代码中 rope_scaling = {"factor": 6.0, "rope_type": "dynamic"}，rope_theta 单独存放
-        # paddleformers 中 standardize_rope_params 读取 rope_parameters 字段
         if self.rope_scaling is not None and not hasattr(self, "rope_parameters"):
             self.rope_parameters = {
                 **self.rope_scaling,

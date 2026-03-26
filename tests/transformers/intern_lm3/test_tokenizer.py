@@ -51,9 +51,8 @@ class TestTokenizer(unittest.TestCase):
             self.skipTest("Model path not available")
 
         text = "hello world, this is a tokenizer test"
-        output = self.tokenizer(text)
-        # tokenizer 返回 BatchEncoding 对象，需要提取 input_ids
-        input_ids = output["input_ids"] if hasattr(output, "__getitem__") else output
+        # 使用 encode 方法获取 token_ids，确保返回 list
+        input_ids = self.tokenizer.encode(text)
         decode_text = self.tokenizer.decode(input_ids, skip_special_tokens=True)
         self.assertEqual(text, decode_text)
 

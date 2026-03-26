@@ -18,9 +18,6 @@
 
 """
 InternLM3 模型实现
-原始代码参考:
-    from transformers import AutoModelForCausalLM
-    from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
 """
 
 from typing import Callable, Optional, cast
@@ -30,6 +27,12 @@ from paddle import nn
 from paddle.distributed.fleet.utils import recompute
 from paddle.distributed.fleet.utils.sequence_parallel_utils import ScatterOp
 
+from .configuration import InternLM3Config
+from ..cache_utils import Cache, DynamicCache
+from ..masking_utils import create_causal_mask_and_row_indices
+from ..model_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast
+from ..model_utils import PretrainedModel, register_base_model
+from ..modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_update
 from ...nn.attention.interface import ALL_ATTENTION_FUNCTIONS
 from ...nn.criterion.interface import CriterionLayer
 from ...nn.embedding import Embedding as GeneralEmbedding
@@ -39,45 +42,15 @@ from ...nn.mlp import MLP
 from ...nn.norm import Norm as GeneralNorm
 from ...nn.pp_model import GeneralModelForCausalLMPipe
 from ...utils.log import logger
-from ..cache_utils import Cache, DynamicCache
-from ..masking_utils import create_causal_mask_and_row_indices
-from ..model_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast
-from ..model_utils import PretrainedModel, register_base_model
-from ..modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_update
-from .configuration import InternLM3Config
 
 
 def rotate_half(x: paddle.Tensor) -> paddle.Tensor:
-    """Rotates half the hidden dims of the input.
-    原始代码:
-        def rotate_half(x):
-            x1 = x[..., : x.shape[-1] // 2]
-            x2 = x[..., x.shape[-1] // 2 :]
-            return torch.cat((-x2, x1), dim=-1)
-    """
     x1 = x[..., : x.shape[-1] // 2]
-    x2 = x[..., x.shape[-1] // 2 :]
+    x2 = x[..., x.shape[-1] // 2:]
     return paddle.concat((-x2, x1), axis=-1)
 
 
 def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
-    """
-    Applies rotary positional embedding to query and key tensors.
-
-    原始代码:
-        def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
-            cos = cos.unsqueeze(unsqueeze_dim)
-            sin = sin.unsqueeze(unsqueeze_dim)
-            q_embed = (q * cos) + (rotate_half(q) * sin)
-            k_embed = (k * cos) + (rotate_half(k) * sin)
-            return q_embed, k_embed
-
-    Args:
-        q (paddle.Tensor): Query tensor with shape [B, N_q, S, D_h].
-        k (paddle.Tensor): Key tensor with shape [B, N_kv, S, D_h].
-        cos (paddle.Tensor): Cosine values with shape [S, D_h].
-        sin (paddle.Tensor): Sine values with shape [S, D_h].
-    """
     cos = cos.unsqueeze(unsqueeze_dim)
     sin = sin.unsqueeze(unsqueeze_dim)
 
@@ -90,17 +63,6 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
 
 
 class InternLM3Attention(nn.Layer):
-    """Multi-headed attention from 'Attention Is All You Need' paper
-
-    原始代码:
-        class InternLM3Attention(nn.Module):
-            def __init__(self, config: InternLM3Config, layer_idx: Optional[int] = None):
-                self.q_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=config.qkv_bias)
-                self.k_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=config.qkv_bias)
-                self.v_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=config.qkv_bias)
-                self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=config.bias)
-    """
-
     def __init__(self, config: InternLM3Config, layer_idx: int):
         super().__init__()
         self.config = config
@@ -120,23 +82,22 @@ class InternLM3Attention(nn.Layer):
         )
         if config.tensor_model_parallel_size > 1:
             assert (
-                self.num_heads % config.tensor_model_parallel_size == 0
+                    self.num_heads % config.tensor_model_parallel_size == 0
             ), f"num_heads: {self.num_heads}, tensor_model_parallel_size: {config.tensor_model_parallel_size}"
             self.num_heads = self.num_heads // config.tensor_model_parallel_size
 
             assert (
-                self.num_key_value_heads % config.tensor_model_parallel_size == 0
+                    self.num_key_value_heads % config.tensor_model_parallel_size == 0
             ), f"num_heads: {self.num_key_value_heads}, tensor_model_parallel_size: {config.tensor_model_parallel_size}"
             self.num_key_value_heads = self.num_key_value_heads // config.tensor_model_parallel_size
 
         self.num_key_value_groups = config.num_attention_heads // config.num_key_value_heads
-        self.scaling = self.head_dim**-0.5
+        self.scaling = self.head_dim ** -0.5
         self.attention_dropout = config.attention_dropout
 
         q_hidden_size = self.head_dim * config.num_attention_heads
         kv_hidden_size = self.head_dim * config.num_key_value_heads
 
-        # InternLM3 使用 qkv_bias 和 bias 配置
         self.q_proj = GeneralLinear.create(
             config.hidden_size,
             q_hidden_size,
@@ -167,13 +128,13 @@ class InternLM3Attention(nn.Layer):
         )
 
     def forward(
-        self,
-        hidden_states: paddle.Tensor,
-        past_key_values: Cache | None = None,
-        attention_mask: paddle.Tensor | None = None,
-        attn_mask_startend_row_indices: paddle.Tensor | None = None,
-        position_embeddings: tuple[paddle.Tensor, paddle.Tensor] | None = None,
-        use_cache: bool = False,
+            self,
+            hidden_states: paddle.Tensor,
+            past_key_values: Cache | None = None,
+            attention_mask: paddle.Tensor | None = None,
+            attn_mask_startend_row_indices: paddle.Tensor | None = None,
+            position_embeddings: tuple[paddle.Tensor, paddle.Tensor] | None = None,
+            use_cache: bool = False,
     ) -> tuple[paddle.Tensor, list[paddle.Tensor] | None]:
         if self.config.sequence_parallel:
             seq_len = self.config.max_sequence_length
@@ -235,14 +196,14 @@ class InternLM3DecoderLayer(nn.Layer):
         )
 
     def forward(
-        self,
-        hidden_states: paddle.Tensor,
-        attention_mask: paddle.Tensor | None = None,
-        attn_mask_startend_row_indices: paddle.Tensor | None = None,
-        position_ids: paddle.Tensor | None = None,
-        position_embeddings: tuple[paddle.Tensor, paddle.Tensor] | None = None,
-        past_key_values: Cache | None = None,
-        use_cache: bool = False,
+            self,
+            hidden_states: paddle.Tensor,
+            attention_mask: paddle.Tensor | None = None,
+            attn_mask_startend_row_indices: paddle.Tensor | None = None,
+            position_ids: paddle.Tensor | None = None,
+            position_embeddings: tuple[paddle.Tensor, paddle.Tensor] | None = None,
+            past_key_values: Cache | None = None,
+            use_cache: bool = False,
     ) -> (tuple[paddle.Tensor] | tuple[paddle.Tensor, paddle.Tensor]):
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
@@ -262,31 +223,13 @@ class InternLM3DecoderLayer(nn.Layer):
         hidden_states = residual + hidden_states
         outputs = (hidden_states,)
 
-        # for pipeline parallel
         if len(outputs) == 1 and isinstance(outputs, tuple):
             outputs = outputs[0]
 
-        return outputs  # type: ignore[return-value]
+        return outputs
 
 
 class InternLM3RotaryEmbedding(nn.Layer):
-    """InternLM3 旋转位置嵌入
-
-    原始代码:
-        class InternLM3RotaryEmbedding(nn.Module):
-            def __init__(self, dim=None, max_position_embeddings=2048, base=10000,
-                device=None, scaling_factor=1.0, rope_type="default",
-                config: Optional[InternLM3Config] = None):
-                super().__init__()
-                self.rope_kwargs = {}
-                if config is None:
-                    logger.warning_once(...)
-                    self.rope_kwargs = {...}
-                self.rope_init_fn = ROPE_INIT_FUNCTIONS[self.rope_type]
-                inv_freq, self.attention_scaling = rope_init_fn(self.config, device, **self.rope_kwargs)
-                self.register_buffer("inv_freq", inv_freq, persistent=False)
-    """
-
     def __init__(self, config):
         super().__init__()
         self.max_seq_len_cached = config.max_position_embeddings
@@ -298,7 +241,6 @@ class InternLM3RotaryEmbedding(nn.Layer):
 
         self.rope_type = "default"
         if hasattr(config, "rope_scaling") and config.rope_scaling is not None:
-            # BC: "rope_type" was originally "type"
             self.rope_type = config.rope_scaling.get("rope_type", config.rope_scaling.get("type", "default"))
 
         rope_init_fn = self.compute_default_rope_parameters
@@ -311,31 +253,26 @@ class InternLM3RotaryEmbedding(nn.Layer):
 
     @staticmethod
     def compute_default_rope_parameters(
-        config: Optional[InternLM3Config] = None,
-        seq_len: Optional[int] = None,
+            config: Optional[InternLM3Config] = None,
+            seq_len: Optional[int] = None,
     ) -> tuple["paddle.Tensor", float]:
-        """
-        Computes the inverse frequencies according to the original RoPE implementation
-        原始代码:
-            inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.int64).float() / dim))
-        """
         base = config.rope_theta
         dim = getattr(config, "head_dim", None)
         if dim is None:
             dim = config.hidden_size // config.num_attention_heads
 
-        attention_factor = 1.0  # Unused in this type of RoPE
-
-        # Compute the inverse frequencies
+        attention_factor = 1.0
         inv_freq = 1.0 / (base ** (paddle.arange(0, dim, 2, dtype=paddle.int64).astype(dtype=paddle.float32) / dim))
         return inv_freq, attention_factor
 
     @dynamic_rope_update
     def forward(self, x, position_ids):
         with paddle.amp.auto_cast(enable=False):
-            inv_freq_expanded = self.inv_freq[None, :, None].astype(paddle.float32).expand([position_ids.shape[0], -1, 1])
+            inv_freq_expanded = self.inv_freq[None, :, None].astype(paddle.float32).expand(
+                [position_ids.shape[0], -1, 1])
             position_ids_expanded = position_ids[:, None, :].astype(paddle.float32)
-            freqs = (inv_freq_expanded.astype(paddle.float32) @ position_ids_expanded.astype(paddle.float32)).transpose(1, 2)
+            freqs = (inv_freq_expanded.astype(paddle.float32) @ position_ids_expanded.astype(paddle.float32)).transpose(
+                1, 2)
             emb = paddle.concat((freqs, freqs), axis=-1)
             cos = emb.cos() * self.attention_scaling
             sin = emb.sin() * self.attention_scaling
@@ -357,12 +294,7 @@ class InternLM3PretrainedModel(PretrainedModel):
 
     @classmethod
     def _gen_aoa_config(cls, config: InternLM3Config):
-        # 禁用 AOA，返回空列表。
-        # paddle sharded 格式权重的键名与模型参数名完全一致，不需要重命名/转置（^T）映射。
-        # model_utils.py 会自动追加 "key -> key, dtype=..." 语句完成 dtype 转换。
-        # 参考: paddleformers/transformers/intern_lm2_5/modeling.py#_gen_aoa_config 的处理方式
-        # 原始代码中包含了 HF格式 到 paddle格式 的转置映射（如 q_proj.weight^T），
-        # 但加载 paddle sharded 格式时不需要这些转置，自引用语句还会导致 AOA shape_propagation 报错。
+        # 禁用 AOA，返回空列表。不然会导致 AOA shape_propagation 报错。
         return {"aoa_statements": []}
 
     @classmethod
@@ -425,16 +357,16 @@ class InternLM3Model(InternLM3PretrainedModel):
         self.rotary_emb = InternLM3RotaryEmbedding(config=config)
 
     def forward(
-        self,
-        input_ids: paddle.Tensor | None = None,
-        attention_mask: paddle.Tensor | None = None,
-        position_ids: paddle.Tensor | None = None,
-        past_key_values: Cache | None = None,
-        inputs_embeds: paddle.Tensor | None = None,
-        attn_mask_startend_row_indices: paddle.Tensor | None = None,
-        use_cache: bool | None = None,
-        output_hidden_states: bool | None = None,
-        return_dict: bool | None = False,
+            self,
+            input_ids: paddle.Tensor | None = None,
+            attention_mask: paddle.Tensor | None = None,
+            position_ids: paddle.Tensor | None = None,
+            past_key_values: Cache | None = None,
+            inputs_embeds: paddle.Tensor | None = None,
+            attn_mask_startend_row_indices: paddle.Tensor | None = None,
+            use_cache: bool | None = None,
+            output_hidden_states: bool | None = None,
+            return_dict: bool | None = False,
     ):
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
@@ -482,10 +414,10 @@ class InternLM3Model(InternLM3PretrainedModel):
                 all_hidden_states.append(hidden_states)
             has_gradient = not hidden_states.stop_gradient
             if (
-                self.config.recompute_granularity == "full"
-                and self.config.recompute_method == "uniform"
-                and self.config.recompute_num_layers == 1
-                and has_gradient
+                    self.config.recompute_granularity == "full"
+                    and self.config.recompute_method == "uniform"
+                    and self.config.recompute_num_layers == 1
+                    and has_gradient
             ):
                 layer_outputs = self.recompute_training(
                     decoder_layer,
@@ -528,17 +460,18 @@ class InternLM3Model(InternLM3PretrainedModel):
             past_key_values=past_key_values,
             hidden_states=all_hidden_states,
         )
+
     @paddle.jit.not_to_static
     def recompute_training(
-        self,
-        layer_module: nn.Layer,
-        hidden_states: paddle.Tensor,
-        attention_mask: paddle.Tensor | None,
-        attn_mask_startend_row_indices: paddle.Tensor | None,
-        position_ids: paddle.Tensor,
-        position_embeddings: paddle.Tensor,
-        past_key_values: Cache | None,
-        use_cache: bool,
+            self,
+            layer_module: nn.Layer,
+            hidden_states: paddle.Tensor,
+            attention_mask: paddle.Tensor | None,
+            attn_mask_startend_row_indices: paddle.Tensor | None,
+            position_ids: paddle.Tensor,
+            position_embeddings: paddle.Tensor,
+            past_key_values: Cache | None,
+            use_cache: bool,
     ):
         cos, sin = position_embeddings
         cos = cos.clone()
@@ -569,19 +502,19 @@ class InternLM3ForCausalLM(InternLM3PretrainedModel):
         self.tie_weights()
 
     def forward(
-        self,
-        input_ids: paddle.Tensor,
-        position_ids: paddle.Tensor | None = None,
-        attention_mask: paddle.Tensor | None = None,
-        attn_mask_startend_row_indices: paddle.Tensor | None = None,
-        inputs_embeds: paddle.Tensor | None = None,
-        labels: paddle.Tensor | None = None,
-        loss_mask: paddle.Tensor | None = None,
-        use_cache: bool = False,
-        past_key_values: Cache | None = None,
-        output_hidden_states: bool | None = False,
-        return_dict: bool = False,
-        **kwargs,
+            self,
+            input_ids: paddle.Tensor,
+            position_ids: paddle.Tensor | None = None,
+            attention_mask: paddle.Tensor | None = None,
+            attn_mask_startend_row_indices: paddle.Tensor | None = None,
+            inputs_embeds: paddle.Tensor | None = None,
+            labels: paddle.Tensor | None = None,
+            loss_mask: paddle.Tensor | None = None,
+            use_cache: bool = False,
+            past_key_values: Cache | None = None,
+            output_hidden_states: bool | None = False,
+            return_dict: bool = False,
+            **kwargs,
     ):
         if kwargs.get("attn_mask_start_row_indices", None) is not None and attn_mask_startend_row_indices is None:
             attn_mask_startend_row_indices = kwargs.pop("attn_mask_start_row_indices")
@@ -630,24 +563,12 @@ class InternLM3ForCausalLM(InternLM3PretrainedModel):
         )
 
     def build_inputs(
-        self,
-        tokenizer,
-        query: str,
-        history: list[tuple[str, str]] | None = None,
-        meta_instruction: str = "",
+            self,
+            tokenizer,
+            query: str,
+            history: list[tuple[str, str]] | None = None,
+            meta_instruction: str = "",
     ):
-        """
-        Build inputs for chat mode.
-        原始代码:
-            def build_inputs(self, tokenizer, query: str, history: List[Tuple[str, str]] = None, meta_instruction=""):
-                if history is None:
-                    history = []
-                if tokenizer.add_bos_token:
-                    prompt = ""
-                else:
-                    prompt = tokenizer.bos_token
-                ...
-        """
         if history is None:
             history = []
         if tokenizer.add_bos_token:
@@ -673,7 +594,6 @@ class InternLM3ForCausalLM(InternLM3PretrainedModel):
     def stream_chat(self):
         """Check if stream_chat method is available (for compatibility)"""
         return True
-
 
 
 class InternLM3ForCausalLMPipe(GeneralModelForCausalLMPipe):

@@ -15,9 +15,6 @@
 
 """
 Tokenization classes for InternLM3.
-原始代码参考:
-    from transformers import AutoTokenizer
-    tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
 """
 
 import os
@@ -38,37 +35,26 @@ SPIECE_UNDERLINE = "▁"
 
 
 class InternLM3Tokenizer(PretrainedTokenizer):
-    """
-    Construct a InternLM3 tokenizer. Based on byte-level Byte-Pair-Encoding.
-
-    原始代码:
-        class InternLM3Tokenizer(PreTrainedTokenizer):
-            def __init__(self, vocab_file, unk_token="<unk>", bos_token="<s>",
-                         eos_token="</s>", pad_token=None, sp_model_kwargs=None,
-                         add_bos_token=True, add_eos_token=False, ...):
-    """
-
     resource_files_names = VOCAB_FILES_NAMES
-    # PretrainedTokenizer.from_pretrained() uses vocab_files_names to locate vocab files
     vocab_files_names = VOCAB_FILES_NAMES
     model_input_names = ["input_ids", "attention_mask"]
 
     def __init__(
-        self,
-        vocab_file,
-        unk_token="<unk>",
-        bos_token="<s>",
-        eos_token="</s>",
-        pad_token=None,
-        sp_model_kwargs: Optional[Dict[str, Any]] = None,
-        add_bos_token=True,
-        add_eos_token=False,
-        clean_up_tokenization_spaces=False,
-        use_default_system_prompt=False,
-        spaces_between_special_tokens=False,
-        spaces_for_interleaved_special_tokens=False,
-        add_prefix_space=True,
-        **kwargs,
+            self,
+            vocab_file,
+            unk_token="<unk>",
+            bos_token="<s>",
+            eos_token="</s>",
+            pad_token=None,
+            sp_model_kwargs: Optional[Dict[str, Any]] = None,
+            add_bos_token=True,
+            add_eos_token=False,
+            clean_up_tokenization_spaces=False,
+            use_default_system_prompt=False,
+            spaces_between_special_tokens=False,
+            spaces_for_interleaved_special_tokens=False,
+            add_prefix_space=True,
+            **kwargs,
     ):
         if spm is None:
             raise ImportError(
@@ -114,66 +100,26 @@ class InternLM3Tokenizer(PretrainedTokenizer):
 
     @property
     def vocab_size(self):
-        """Returns vocab size
-        原始代码:
-            @property
-            def vocab_size(self):
-                return self.sp_model.get_piece_size()
-        """
         return self.sp_model.get_piece_size()
 
     def get_vocab(self):
-        """Returns vocab as a dict
-        原始代码:
-            def get_vocab(self):
-                vocab = {self.convert_ids_to_tokens(i): i for i in range(self.vocab_size)}
-                vocab.update(self.added_tokens_encoder)
-                return vocab
-        """
         vocab = {self.convert_ids_to_tokens(i): i for i in range(self.vocab_size)}
         vocab.update(self.added_tokens_encoder)
         return vocab
 
     def tokenize(self, text, **kwargs):
-        """
-        原始代码:
-            def tokenize(self, text: "TextInput", **kwargs) -> List[str]:
-                return super().tokenize(text, **kwargs)
-        """
         return super().tokenize(text, **kwargs)
 
     def _tokenize(self, text, **kwargs):
-        """
-        原始代码:
-            def _tokenize(self, text, **kwargs):
-                return self.sp_model.encode(text, out_type=str)
-        """
         return self.sp_model.encode(text, out_type=str)
 
     def _convert_token_to_id(self, token):
-        """Converts a token (str) in an id using the vocab.
-        原始代码:
-            def _convert_token_to_id(self, token):
-                return self.sp_model.piece_to_id(token)
-        """
         return self.sp_model.piece_to_id(token)
 
     def _convert_id_to_token(self, index):
-        """Converts an index (integer) in a token (str) using the vocab.
-        原始代码:
-            def _convert_id_to_token(self, index):
-                return self.decoder.get(index, "")
-        """
         return self.decoder.get(index, "")
 
     def convert_tokens_to_string(self, tokens):
-        """Converts a sequence of tokens (string) in a single string.
-        原始代码:
-            def convert_tokens_to_string(self, tokens):
-                if tokens[0].startswith(SPIECE_UNDERLINE) and self.add_prefix_space:
-                    tokens[0] = tokens[0][1:]
-                ...
-        """
         if tokens and tokens[0].startswith(SPIECE_UNDERLINE) and self.add_prefix_space:
             tokens[0] = tokens[0][1:]
 
@@ -189,11 +135,11 @@ class InternLM3Tokenizer(PretrainedTokenizer):
                 current_sub_tokens = []
             else:
                 if (
-                    prev_is_special
-                    and i == 1
-                    and self.add_prefix_space
-                    and not token.startswith(SPIECE_UNDERLINE)
-                    and self.spaces_for_interleaved_special_tokens
+                        prev_is_special
+                        and i == 1
+                        and self.add_prefix_space
+                        and not token.startswith(SPIECE_UNDERLINE)
+                        and self.spaces_for_interleaved_special_tokens
                 ):
                     out_string += " "
                 current_sub_tokens.append(token)
@@ -202,15 +148,6 @@ class InternLM3Tokenizer(PretrainedTokenizer):
         return out_string
 
     def save_vocabulary(self, save_directory, filename_prefix: Optional[str] = None) -> Tuple[str]:
-        """
-        Save the vocabulary and special tokens file to a directory.
-        原始代码:
-            def save_vocabulary(self, save_directory, filename_prefix: Optional[str] = None) -> Tuple[str]:
-                if not os.path.isdir(save_directory):
-                    logger.error(f"Vocabulary path ({save_directory}) should be a directory")
-                    return
-                ...
-        """
         if not os.path.isdir(save_directory):
             logger.error(f"Vocabulary path ({save_directory}) should be a directory")
             return
@@ -228,14 +165,6 @@ class InternLM3Tokenizer(PretrainedTokenizer):
         return (out_vocab_file,)
 
     def build_inputs_with_special_tokens(self, token_ids_0, token_ids_1=None):
-        """
-        原始代码:
-            def build_inputs_with_special_tokens(self, token_ids_0, token_ids_1=None):
-                bos_token_id = [self.bos_token_id] if self.add_bos_token else []
-                eos_token_id = [self.eos_token_id] if self.add_eos_token else []
-                output = bos_token_id + token_ids_0 + eos_token_id
-                ...
-        """
         bos_token_id = [self.bos_token_id] if self.add_bos_token else []
         eos_token_id = [self.eos_token_id] if self.add_eos_token else []
 
@@ -247,17 +176,10 @@ class InternLM3Tokenizer(PretrainedTokenizer):
         return output
 
     def get_special_tokens_mask(
-        self, token_ids_0: List[int], token_ids_1: Optional[List[int]] = None, already_has_special_tokens: bool = False
+            self, token_ids_0: List[int], token_ids_1: Optional[List[int]] = None,
+            already_has_special_tokens: bool = False
     ) -> List[int]:
-        """
-        原始代码:
-            def get_special_tokens_mask(self, token_ids_0, token_ids_1=None, already_has_special_tokens=False):
-                if already_has_special_tokens:
-                    return super().get_special_tokens_mask(...)
-                bos_token_id = [1] if self.add_bos_token else []
-                eos_token_id = [1] if self.add_eos_token else []
-                ...
-        """
+
         if already_has_special_tokens:
             return super().get_special_tokens_mask(
                 token_ids_0=token_ids_0, token_ids_1=token_ids_1, already_has_special_tokens=True
@@ -268,18 +190,11 @@ class InternLM3Tokenizer(PretrainedTokenizer):
 
         if token_ids_1 is None:
             return bos_token_id + ([0] * len(token_ids_0)) + eos_token_id
-        return bos_token_id + ([0] * len(token_ids_0)) + eos_token_id + bos_token_id + ([0] * len(token_ids_1)) + eos_token_id
+        return bos_token_id + ([0] * len(token_ids_0)) + eos_token_id + bos_token_id + (
+                    [0] * len(token_ids_1)) + eos_token_id
 
-    def create_token_type_ids_from_sequences(self, token_ids_0: List[int], token_ids_1: Optional[List[int]] = None) -> List[int]:
-        """
-        Creates a mask from the two sequences passed to be used in a sequence-pair classification task.
-        原始代码:
-            def create_token_type_ids_from_sequences(self, token_ids_0, token_ids_1=None):
-                bos_token_id = [self.bos_token_id] if self.add_bos_token else []
-                eos_token_id = [self.eos_token_id] if self.add_eos_token else []
-                output = [0] * len(bos_token_id + token_ids_0 + eos_token_id)
-                ...
-        """
+    def create_token_type_ids_from_sequences(self, token_ids_0: List[int], token_ids_1: Optional[List[int]] = None) -> \
+    List[int]:
         bos_token_id = [self.bos_token_id] if self.add_bos_token else []
         eos_token_id = [self.eos_token_id] if self.add_eos_token else []
 
@@ -291,24 +206,18 @@ class InternLM3Tokenizer(PretrainedTokenizer):
         return output
 
     def encode(
-        self,
-        text: None = None,
-        text_pair: None = None,
-        add_special_tokens: bool = True,
-        padding: bool | str = False,
-        truncation: bool | str | None = None,
-        max_length: int | None = None,
-        stride: int = 0,
-        padding_side: str | None = None,
-        return_tensors: str | None = None,
-        **kwargs,
+            self,
+            text: None = None,
+            text_pair: None = None,
+            add_special_tokens: bool = True,
+            padding: bool | str = False,
+            truncation: bool | str | None = None,
+            max_length: int | None = None,
+            stride: int = 0,
+            padding_side: str | None = None,
+            return_tensors: str | None = None,
+            **kwargs,
     ) -> List[int]:
-        """
-        Encodes a string into a list of token IDs.
-
-        This method is adapted for full parameter fine-tuning.
-        原始代码参考 internlm2_5 的实现。
-        """
         padding_strategy, truncation_strategy, max_length, kwargs_updated = self._get_padding_truncation_strategies(
             padding=padding,
             truncation=truncation,
