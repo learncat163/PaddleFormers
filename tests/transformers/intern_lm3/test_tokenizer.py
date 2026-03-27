@@ -16,16 +16,17 @@ import os
 import tempfile
 import unittest
 
-from paddleformers.transformers.intern_lm3 import InternLM3Tokenizer
+from paddleformers.transformers import InternLM3Tokenizer
 
-model_path = "/mnt/caoyuanye/llm/internlm/internlm3-8b-instruct_paddle_sharded"
+# 单测时只下载token，还能接受
+hf_model_path = "internlm/internlm3-8b-instruct"
 
 
 class TestTokenizer(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         try:
-            cls.tokenizer = InternLM3Tokenizer.from_pretrained(model_path)
+            cls.tokenizer = InternLM3Tokenizer.from_pretrained(hf_model_path, download_hub="huggingface")
         except Exception:
             cls.tokenizer = None
 

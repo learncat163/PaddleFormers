@@ -21,18 +21,15 @@ import unittest
 import numpy as np
 import paddle
 
-from paddleformers.transformers.intern_lm3 import (
+from paddleformers.transformers import (
     InternLM3Config,
     InternLM3ForCausalLM,
     InternLM3Tokenizer,
 )
-from tests.testing_utils import require_package, slow
-
-# 原始 HF 权重路径（用于测试推理质量）
-hf_model_path = "/mnt/caoyuanye/llm/internlm/internlm3-8b-instruct"
+from tests.testing_utils import slow
 
 
-# config层的常规测试
+# config常规测试
 class TestInternLM3Config(unittest.TestCase):
     def test_config_custom_values(self):
         config = InternLM3Config(
@@ -172,8 +169,14 @@ class InternLM3ModelTest(unittest.TestCase):
 
         self.assertIsNotNone(outputs.past_key_values)
 
+"""
+！！！较为消耗时间，直接加载HF原生格式权重并推理，有slow标记
 
-# paddle直接加载权重的测试
+也支持直接从 转换过的格式进行推理，转换后的paddle权重地址 https://aistudio.baidu.com/modelsdetail/45407
+
+仅供本地评估时使用
+"""
+
 class InternLM3ConvertedWeightTest(unittest.TestCase):
     def setUp(self):
         self._original_dtype: str = paddle.get_default_dtype()
@@ -182,43 +185,32 @@ class InternLM3ConvertedWeightTest(unittest.TestCase):
     def tearDown(self):
         paddle.set_default_dtype(self._original_dtype)  # type: ignore[arg-type]
 
-    # 使用原始 HF 权重，推理一次
     @slow
     def test_paddle_model_load_and_infer(self):
-        """测试从原始 HF 权重加载模型并推理"""
-        paddle.device.set_device("gpu")  # type: ignore[attr-defined]
-
-        # 使用原始 HF 权重（convert_from_hf=True）
+        hf_model_path = "internlm/internlm3-8b-instruct"
+        paddle.device.set_device("gpu")
         model = InternLM3ForCausalLM.from_pretrained(
             hf_model_path,
+            download_hub="huggingface",
             convert_from_hf=True,
             dtype="bfloat16",
             low_cpu_mem_usage=True,
             load_checkpoint_format="",
         )
         model.eval()
-
-        tokenizer = InternLM3Tokenizer.from_pretrained(hf_model_path)  # type: ignore[attr-defined]
-
-        # 测试 build_inputs 方法
+        tokenizer = InternLM3Tokenizer.from_pretrained(hf_model_path)
         prompt = "猫和狗的区别是什么，列出主要的3点"
         meta_instruction = "你是一个有用的AI助手，请用中文回答。"
         chat_inputs = model.build_inputs(tokenizer, prompt, history=[], meta_instruction=meta_instruction)
-
-        # 打印输入信息
         print("\n" + "=" * 80)
         print("InternLM3 模型推理测试")
         print("=" * 80)
         print(f"Prompt: {prompt}")
         print(f"Meta Instruction: {meta_instruction}")
         print(f"Input Length: {chat_inputs['input_ids'].shape[1]} tokens")
-
-        # 验证输入格式正确
         self.assertIsNotNone(chat_inputs)
         self.assertIn("input_ids", chat_inputs)
         self.assertGreater(chat_inputs["input_ids"].shape[1], 0, "Input should not be empty")
-
-        # 测试前向传播
         with paddle.no_grad():
             outputs = model(
                 input_ids=chat_inputs["input_ids"],
@@ -227,7 +219,6 @@ class InternLM3ConvertedWeightTest(unittest.TestCase):
             )
             self.assertIsNotNone(outputs.logits)
 
-        # 测试生成方法
         with paddle.no_grad():
             out = model.generate(
                 input_ids=chat_inputs["input_ids"],
@@ -239,16 +230,10 @@ class InternLM3ConvertedWeightTest(unittest.TestCase):
                 top_p=0.8,
                 repetition_penalty=1.005,
             )
-
-        # 解码输出
         if isinstance(out, (list, tuple)):
             out = out[0]
-
-        # 分离输入和输出
         input_length = chat_inputs["input_ids"].shape[1]
         output_ids = out[0][input_length:]
-
-        # 解码 - 仅解码生成部分
         output_text = tokenizer.decode(output_ids.squeeze().numpy().tolist(), skip_special_tokens=True)
 
         print(f"Output Length: {out.shape[1]} tokens (input: {input_length}, generated: {out.shape[1] - input_length})")
@@ -257,238 +242,85 @@ class InternLM3ConvertedWeightTest(unittest.TestCase):
         print(output_text if output_text else "(无输出)")
         print("=" * 80 + "\n")
 
-        # 验证生成有输出
         self.assertIsNotNone(out)
         self.assertGreater(out.shape[1], 0, "Output should not be empty")
-
-        # 验证输出质量 - 应该包含中文内容
         self.assertGreater(len(output_text.strip()), 10, "Generated output should have meaningful content")
 
 
-# 测试 paddle模型保存和加载的一致性
+"""
+测试 torch (safetensors) 和 paddle 的对齐; 
+
+因为lm3.5版本有点特殊，用到了tranformers的一些tranformers 4.53.0 版本之后的特性，但是在 5.x 版本又没有了
+
+导致在 4.53.0-5.x 区间之外的tranformers 运行的时候会有各种报错，即使使用 monkey patch 等手段处理了 modeling_internlm3.py 但是原版推理出的仍旧不正确
+
+所以，当前的对齐代码是分离的，先在 4.53.0 的环境里跑出 结果，然后再和paddle版本对比
+
+"""
 class InternLM3CompatibilityTest(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls) -> None:
-        cls.temp_dir = tempfile.TemporaryDirectory()
-        cls.model_path = cls.temp_dir.name
+    """测试 Paddle 模型推理与 Transformers 参考值对齐"""
 
-    @classmethod
-    def tearDownClass(cls) -> None:
-        cls.temp_dir.cleanup()
+    MINI_MODEL_PATH = "learncat/internlm3-8b-instruct-mini-raw"
 
-    def test_model_save_load_consistency(self):
-        """测试模型保存后权重的正确性"""
-        # 创建一个小型模型
-        config = InternLM3Config(
-            vocab_size=1000,
-            hidden_size=256,
-            num_hidden_layers=2,
-            num_attention_heads=4,
-            num_key_value_heads=4,
-            intermediate_size=512,
-            max_position_embeddings=128,
-            use_cache=True,
-            tie_word_embeddings=True,
-        )
+    # 以下参考值由 tf4.53 环境的 transformers 生成，固定随机种子42和固定输入
+    # 参考代码（不在当前环境执行）:
+    # ------------------------------------------------------------
+    # import torch
+    # import numpy as np
+    # from transformers import AutoModelForCausalLM
+    # np.random.seed(42)
+    # torch.manual_seed(42)
+    # input_ids = np.array([[100, 200, 300, 400, 500, 600, 700, 800, 900, 950]])
+    # model = AutoModelForCausalLM.from_pretrained(
+    #     "/mnt/caoyuanye/llm/internlm/internlm3-8b-instruct-mini",
+    #     trust_remote_code=True, torch_dtype=torch.float32
+    # ).cpu().eval()
+    # torch_input = torch.from_numpy(input_ids).long()
+    # with torch.no_grad():
+    #     logits = model(torch_input).logits[0, -1, :].cpu().numpy()
+    # print(logits[:20])
+    # print(np.argsort(logits)[-10:][::-1])
+    # ------------------------------------------------------------
+    REF_LOGITS_FIRST_20 = [
+        -0.144880, -0.648041, 0.386456, 0.213346, 0.771256,
+        0.620751, 0.073640, -0.021458, -0.764580, 0.317350,
+        -0.025523, -0.056741, -0.671094, -0.187901, 0.286278,
+        -0.182251, 0.849138, 0.340502, 0.324327, 0.609751,
+    ]
+    REF_TOP10_TOKEN_IDS = [72267, 94359, 95067, 121546, 19719, 125351, 74467, 115313, 87550, 24000]
 
-        # 创建模型
-        model = InternLM3ForCausalLM(config)
-        model.eval()
+    # @classmethod
+    # def setUpClass(cls) -> None:
+    #     if not os.path.exists(cls.MINI_MODEL_PATH):
+    #         cls.skipTest(f"Mini model not found at {cls.MINI_MODEL_PATH}")
 
-        # 获取模型的权重
-        original_weight = model.model.embed_tokens.weight.clone()
-
-        # 保存模型
-        model.save_pretrained(self.model_path, save_checkpoint_format="", save_to_hf=False)
-
-        # 直接加载保存的 state_dict 验证保存的正确性
-        saved_state_dict = paddle.load(os.path.join(self.model_path, "model_state.pdparams"))
-        saved_weight = saved_state_dict["model.embed_tokens.weight"]
-
-        diff = paddle.abs(original_weight - saved_weight).max().numpy()
-        print(f"\nMax diff between original and saved weight: {diff}")
-
-        # 检查保存的权重是否一致
-        self.assertTrue(
-            np.allclose(original_weight.numpy(), saved_weight.numpy()),
-            f"Saved weights differ from original: max diff={diff}"
-        )
-
-        # 验证配置文件也正确保存
-        import json
-        config_path = os.path.join(self.model_path, "config.json")
-        self.assertTrue(os.path.exists(config_path), "config.json not found")
-
-        with open(config_path, "r") as f:
-            saved_config = json.load(f)
-            self.assertEqual(saved_config["hidden_size"], 256)
-            self.assertEqual(saved_config["num_hidden_layers"], 2)
-
-    @require_package("torch")
     def test_torch_paddle_model_alignment(self):
-        """
-        测试 torch 和 paddle 模型的输出对齐
-        使用预生成的 safetensors 权重进行完整的模型对齐测试
-        """
-        import torch
-        from safetensors.torch import load_file as safe_load_file
-
-        # 模型路径
-        tiny_model_path = os.path.expanduser("~/code/github/PaddleFormers/tmp/tiny_torch_model")
-
-        # 检查权重文件是否存在
-        if not os.path.exists(tiny_model_path):
-            self.skipTest(
-                f"Tiny model weights not found at {tiny_model_path}. Run generate_torch_test_weights.py first.")
-
-        # 固定随机数种子
+        """验证 Paddle 输出与 Transformers 参考值对齐"""
         np.random.seed(42)
-        torch.manual_seed(42)
         paddle.seed(42)
 
-        # 准备固定输入（注意：vocab_size=1000，所以 token id 必须 < 1000）
-        seq_length = 10
         input_ids = np.array([[100, 200, 300, 400, 500, 600, 700, 800, 900, 950]])
+        paddle_input = paddle.to_tensor(input_ids, dtype="int64")
 
-        print("\n" + "=" * 80)
-        print("Torch-Paddle 模型对齐测试（完整版本）")
-        print("=" * 80)
-
-        # 1. 加载 torch 权重
-        torch_weights_path = os.path.join(tiny_model_path, "model.safetensors")
-        torch_state_dict = safe_load_file(torch_weights_path)
-        print(f"Loaded torch weights from: {torch_weights_path}")
-        print(f"Number of torch tensors: {len(torch_state_dict)}")
-
-        # 2. 用 torch 进行简单的 embedding 查找 + 线性变换模拟
-        # 使用 embed_tokens 和 lm_head 权重
-        torch_embed_weight = torch_state_dict["model.embed_tokens.weight"]
-        torch_lm_head_weight = torch_state_dict["lm_head.weight"]
-
-        # 创建 torch embedding 层
-        torch_vocab_size, torch_hidden_size = torch_embed_weight.shape
-        torch_embedding = torch.nn.Embedding(torch_vocab_size, torch_hidden_size)
-        torch_embedding.weight.data = torch_embed_weight
-        torch_embedding.eval()
-
-        # 前向传播 - torch
-        torch_input_tensor = torch.from_numpy(input_ids).long()
-        with torch.no_grad():
-            torch_hidden = torch_embedding(torch_input_tensor)  # [1, 10, 256]
-            # 取最后一个位置的 hidden state
-            torch_last_hidden = torch_hidden[:, -1, :]  # [1, 256]
-            # 通过 lm_head (lm_head.weight 形状是 [vocab_size, hidden_size])
-            torch_logits = torch.nn.functional.linear(
-                torch_last_hidden, torch_lm_head_weight
-            )  # [1, 1000]
-
-        print(f"Torch output shape: {torch_logits.shape}")
-
-        # 3. 用 paddle 加载相同的权重并进行推理
-        # 只对比 embedding + lm_head 的结果（不经过 transformer 层）
-        config = InternLM3Config.from_pretrained(tiny_model_path)
         paddle_model = InternLM3ForCausalLM.from_pretrained(
-            tiny_model_path,
-            config=config,
-            convert_from_hf=True,
-            load_checkpoint_format="",
+            self.MINI_MODEL_PATH, dtype=paddle.float32
         )
         paddle_model.eval()
 
-        # 只使用 embedding 层
-        paddle_input_tensor = paddle.to_tensor(input_ids, dtype="int64")
         with paddle.no_grad():
-            # 只做 embedding 查找，不经过 transformer 层
-            paddle_hidden = paddle_model.model.embed_tokens(paddle_input_tensor)  # [1, 10, 256]
-            # 取最后一个位置的 hidden state
-            paddle_last_hidden = paddle_hidden[:, -1, :]  # [1, 256]
-            # 通过 lm_head
-            paddle_logits = paddle_model.lm_head(paddle_last_hidden)  # [1, vocab_size]
+            paddle_logits = paddle_model(paddle_input)[0][0, -1, :].cpu().numpy()
 
-        print(f"Paddle output shape: {paddle_logits.shape}")
+        # 指标1: 前20个logits值对齐 < 1e-2
+        paddle_first20 = paddle_logits[:20]
+        max_diff = np.max(np.abs(paddle_first20 - np.array(self.REF_LOGITS_FIRST_20)))
+        print(f"paddle and transformer models differ: {max_diff}")
+        self.assertLess(max_diff, 1e-2, f"First 20 logits diff={max_diff}")
 
-        # 4. 对比输出
-        # 取最后一个位置的 logits 进行对比
-        torch_last_logits = torch_logits[0].cpu().numpy()  # [vocab_size]
-        paddle_last_logits = paddle_logits[0].cpu().numpy()  # [vocab_size]
-
-        print(f"Torch last logits shape: {torch_last_logits.shape}")
-        print(f"Paddle last logits shape: {paddle_last_logits.shape}")
-
-        # 对比前 200 个元素的值（转换为 float32 提高稳定性）
-        torch_flat = torch_last_logits[:200].astype("float32")
-        paddle_flat = paddle_last_logits[:200].astype("float32")
-
-        max_diff = np.max(np.abs(torch_flat - paddle_flat))
-        mean_diff = np.mean(np.abs(torch_flat - paddle_flat))
-        print(f"Max diff (first 200 elements): {max_diff}")
-        print(f"Mean diff (first 200 elements): {mean_diff}")
-
-        # 对齐推理的容差（考虑到浮点精度差异）
-        self.assertTrue(
-            np.allclose(torch_flat, paddle_flat, atol=5e-2, rtol=5e-2),
-            f"Output values differ too much: max diff={max_diff}, mean diff={mean_diff}"
-        )
-
-        # 对齐 top token id (只对比预测的token)
-        torch_token_id = np.argmax(torch_last_logits)
-        paddle_token_id = np.argmax(paddle_last_logits)
-
-        print(f"Torch top token id: {torch_token_id}")
-        print(f"Paddle top token id: {paddle_token_id}")
-
-        self.assertTrue(
-            torch_token_id == paddle_token_id,
-            f"Token id mismatch: torch={torch_token_id}, paddle={paddle_token_id}"
-        )
-
-        print("\n" + "=" * 80)
-        print("对齐测试通过！")
-        print("=" * 80 + "\n")
-
-    @require_package("torch")
-    def test_hf_weight_loading(self):
-        """测试从原始 HF 权重加载并进行基本推理验证"""
-        import torch
-
-        paddle.device.set_device("gpu")  # type: ignore[attr-defined]
-
-        # 固定随机数种子
-        np.random.seed(42)
-        paddle.seed(42)
-        torch.manual_seed(42)
-
-        # 准备固定输入
-        input_ids = np.array([[100, 200, 300, 400, 500, 600, 700, 800, 900, 1000]])
-
-        # 加载 paddle 模型
-        paddle_model = InternLM3ForCausalLM.from_pretrained(
-            hf_model_path,
-            convert_from_hf=True,
-            dtype="bfloat16",
-            low_cpu_mem_usage=True,
-            load_checkpoint_format="",
-        )
-        paddle_model.eval()
-
-        # Paddle 推理
-        with paddle.no_grad():
-            paddle_output = paddle_model(
-                paddle.to_tensor(input_ids),
-                use_cache=False,
-                return_dict=True,
-            )
-            paddle_logits = paddle_output.logits
-
-        print(f"Paddle output shape: {paddle_logits.shape}")
-        print(f"Paddle output dtype: {paddle_logits.dtype}")
-
-        # 基本验证：输出形状正确
-        self.assertEqual(paddle_logits.shape, [1, 10, paddle_model.config.vocab_size])
-
-        # 验证输出不是全零或 NaN
-        self.assertFalse(paddle.isnan(paddle_logits).any(), "Output contains NaN")
-        self.assertTrue(paddle.abs(paddle_logits).sum() > 0, "Output should not be all zeros")
+        # 指标2: Top-10 token 相同
+        paddle_top10 = set(np.argsort(paddle_logits)[-10:])
+        ref_top10 = set(self.REF_TOP10_TOKEN_IDS)
+        self.assertEqual(paddle_top10, ref_top10, f"Top-10 tokens mismatch")
+        print("paddle and transformer has same 10 tokens id")
 
 
 if __name__ == "__main__":

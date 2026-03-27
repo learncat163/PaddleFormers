@@ -22,7 +22,7 @@ if [ -f 'PaddleFleet/.venv/bin/activate' ]; then
    source PaddleFleet/.venv/bin/activate
 fi
 
-config_sft_yaml=$root_dir/PaddleFormers/tests/config/ci/interlm2_sft.yaml
+config_sft_yaml=$root_dir/PaddleFormers/tests/config/ci/interlm3_sft.yaml
 
 if [[ ! -f "$config_sft_yaml" ]]; then
   echo "Config file not found: $config_sft_yaml"

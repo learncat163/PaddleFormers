@@ -294,8 +294,36 @@ class InternLM3PretrainedModel(PretrainedModel):
 
     @classmethod
     def _gen_aoa_config(cls, config: InternLM3Config):
-        # 禁用 AOA，返回空列表。不然会导致 AOA shape_propagation 报错。
-        return {"aoa_statements": []}
+        model_prefix = cls.base_model_prefix + "." if cls != cls.base_model_class else ""
+
+        aoa_statements = [
+            f"model.embed_tokens.weight -> {model_prefix}embed_tokens.weight",
+            f"model.norm.weight -> {model_prefix}norm.weight",
+            f"model.layers.$LAYER_ID.input_layernorm.weight -> {model_prefix}layers.$LAYER_ID.input_layernorm.weight",
+            f"model.layers.$LAYER_ID.post_attention_layernorm.weight -> {model_prefix}layers.$LAYER_ID.post_attention_layernorm.weight",
+        ]
+
+        aoa_statements.extend(
+            [
+                f"model.layers.$LAYER_ID.self_attn.{proj_name}.weight^T -> {model_prefix}layers.$LAYER_ID.self_attn.{proj_name}.weight"
+                for proj_name in ["q_proj", "k_proj", "v_proj", "o_proj"]
+            ]
+        )
+
+        aoa_statements.extend(
+            [
+                f"model.layers.$LAYER_ID.mlp.{PROJECTOR_NAME}.weight^T -> {model_prefix}layers.$LAYER_ID.mlp.{PROJECTOR_NAME}.weight"
+                for PROJECTOR_NAME in ["gate_proj", "up_proj", "down_proj"]
+            ]
+        )
+
+        if cls != cls.base_model_class:
+            if config.tie_word_embeddings:
+                aoa_statements.append("model.embed_tokens.weight -> lm_head.weight")
+            else:
+                aoa_statements.append("lm_head.weight -> lm_head.weight")
+
+        return {"aoa_statements": aoa_statements}
 
     @classmethod
     def _gen_inv_aoa_config(cls, config: InternLM3Config):
