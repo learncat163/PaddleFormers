@@ -23,7 +23,7 @@ dataloader_num_workers: 24
 prefetch_factor: 24
 
 ### model
-model_name_or_path: Qwen/Qwen3-30B-A3B-Base
+model_name_or_path: /root/paddlejob/share-storage/gpfs/system-public/efficient_benchmark/huggingface/Qwen/Qwen3-30B-A3B
 _attn_implementation: flashmask
 use_qk_norm: true
 
@@ -79,15 +79,13 @@ moe_grouped_gemm: true
 moe_ep_barrier: false
 moe_router_fusion: true
 moe_router_force_load_balancing: false
+router_aux_loss_coef: 0.0
 
 # pp
-pp_delay_scale_loss: true
 overlap_p2p_comm: true
 variable_seq_lengths: true
 best_unbalanced_scheduler: true
 
-
-tp_delay_scale_loss: True
 
 optim: adamw
 bf16: true
