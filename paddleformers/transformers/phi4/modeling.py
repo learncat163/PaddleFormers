@@ -14,23 +14,19 @@
 
 import copy
 import math
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, Optional
 
 import paddle
 import paddle.nn.functional as F
 from paddle import nn
 from paddle.distributed.fleet.utils import recompute
 
-from ...nn.criterion.interface import CriterionLayer
-from ...nn.embedding import Embedding as GeneralEmbedding
-from ...nn.linear import Linear as GeneralLinear
-from ...nn.lm_head import LMHead as GeneralLMHead
-from ...nn.norm import Norm as GeneralNorm
-from ...utils.log import logger
-from ..cache_utils import Cache, DynamicCache
+from .configuration import Phi4Config
 from ..model_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast
 from ..model_utils import PretrainedModel, register_base_model
-from .configuration import Phi4Config
+from ...nn.criterion.interface import CriterionLayer
+from ...nn.lm_head import LMHead as GeneralLMHead
+from ...utils.log import logger
 
 
 def swiglu(x, y):
@@ -42,42 +38,46 @@ def swiglu(x, y):
 
 
 def selective_scan_paddle(x, dt, A, B, C, D, z=None, delta_bias=None, delta_softplus=True):
-    """
-    Pure PaddlePaddle implementation of selective scan (slow but functional)
-    x: (batch, d_inner, seq_len)
-    dt: (batch, d_inner, seq_len)
-    A: (d_inner, d_state)
-    B: (batch, d_state, seq_len)
-    C: (batch, d_state, seq_len)
-    D: (d_inner,)
-    z: (batch, d_inner, seq_len) optional for gating
-    """
+    # x: (batch, d_inner, seq_len)
+    # dt: (batch, d_inner, seq_len)
+    # A: (d_inner, d_state)
+    # B: (batch, d_state, seq_len)
+    # C: (batch, d_state, seq_len)
+    # D: (d_inner,)
     batch, d_inner, seq_len = x.shape
     _, d_state, _ = B.shape
-    
+    orig_dtype = x.dtype
+
+    x = x.astype('float32')
+    dt = dt.astype('float32')
+    A = A.astype('float32')
+    B = B.astype('float32')
+    C = C.astype('float32')
+    D = D.astype('float32')
+
     if delta_bias is not None:
-        dt = dt + delta_bias.reshape([1, -1, 1])
+        dt = dt + delta_bias.reshape([1, -1, 1]).astype('float32')
     if delta_softplus:
         dt = F.softplus(dt)
-    
-    dA = paddle.exp(paddle.einsum('bdn,dn->bdn', dt, A))
-    dB = paddle.einsum('bdn,bnt->bdnt', dt, B)
-    
-    state = paddle.zeros([batch, d_inner, d_state], dtype=x.dtype)
+
+    dA = paddle.exp(paddle.einsum('bdl,ds->bdsl', dt, A))
+    dB = paddle.einsum('bdl,bsl->bdsl', dt, B)
+
+    state = paddle.zeros([batch, d_inner, d_state], dtype='float32')
     outputs = []
-    
+
     for i in range(seq_len):
-        state = state * dA[:, :, i] + x[:, :, i:i+1] * dB[:, :, :, i]
-        y = paddle.einsum('bdn,bn->bd', state, C[:, :, i])
+        state = state * dA[:, :, :, i] + x[:, :, i:i+1] * dB[:, :, :, i]
+        y = paddle.einsum('bds,bs->bd', state, C[:, :, i])
         y = y + D * x[:, :, i]
         outputs.append(y)
-    
+
     y = paddle.stack(outputs, axis=2)
-    
+
     if z is not None:
-        y = y * F.silu(z)
-    
-    return y
+        y = y * F.silu(z.astype('float32'))
+
+    return y.astype(orig_dtype)
 
 
 class Phi4RMSNorm(nn.Layer):
@@ -95,10 +95,100 @@ class Phi4RMSNorm(nn.Layer):
         hidden_states = hidden_states.astype("float32")
         variance = hidden_states.pow(2).mean(-1, keepdim=True)
         hidden_states = hidden_states * paddle.rsqrt(variance + self.variance_epsilon)
-        return self.weight * hidden_states.astype(input_dtype)
+        return self.weight.astype(input_dtype) * hidden_states.astype(input_dtype)
 
 
 PHI_NORM_CLASS = nn.LayerNorm
+
+
+def lambda_init_fn(depth):
+    return 0.8 - 0.6 * math.exp(-0.3 * depth)
+
+
+class Phi4DiffAttention(nn.Layer):
+    def __init__(self, head_dim, layer_idx):
+        super().__init__()
+        self.head_dim = head_dim
+        self.lambda_init = lambda_init_fn(layer_idx if layer_idx is not None else 0)
+        self.lambda_q1 = paddle.create_parameter(
+            shape=[head_dim], dtype='float32',
+            default_initializer=nn.initializer.Normal(mean=0., std=0.1)
+        )
+        self.lambda_k1 = paddle.create_parameter(
+            shape=[head_dim], dtype='float32',
+            default_initializer=nn.initializer.Normal(mean=0., std=0.1)
+        )
+        self.lambda_q2 = paddle.create_parameter(
+            shape=[head_dim], dtype='float32',
+            default_initializer=nn.initializer.Normal(mean=0., std=0.1)
+        )
+        self.lambda_k2 = paddle.create_parameter(
+            shape=[head_dim], dtype='float32',
+            default_initializer=nn.initializer.Normal(mean=0., std=0.1)
+        )
+        self.subln = Phi4RMSNorm(2 * head_dim, eps=1e-5)
+
+    @staticmethod
+    def _repeat_kv(x, n_rep):
+        batch, n_heads, slen, head_dim = x.shape
+        if n_rep == 1:
+            return x
+        x = x.unsqueeze(2).tile([1, 1, n_rep, 1, 1])
+        return x.reshape([batch, n_heads * n_rep, slen, head_dim])
+
+    def forward(self, q, k, v, attention_mask=None):
+        # q: (B, H, S, D), k: (B, H_kv, S, D), v: (B, H_kv, S, D)
+        # Returns: (B, H, S, D)
+        bsz, n_heads, seqlen, head_dim = q.shape
+        n_kv_heads = k.shape[1]
+        n_rep = n_heads // n_kv_heads
+        scale = 1.0 / math.sqrt(head_dim)
+
+        q1 = q[:, 0::2]
+        q2 = q[:, 1::2]
+        k1 = k[:, 0::2]
+        k2 = k[:, 1::2]
+        v1 = v[:, 0::2]
+        v2 = v[:, 1::2]
+
+        if n_rep > 1:
+            k1 = self._repeat_kv(k1, n_rep)
+            k2 = self._repeat_kv(k2, n_rep)
+            v1 = self._repeat_kv(v1, n_rep)
+            v2 = self._repeat_kv(v2, n_rep)
+
+        attn_w1 = paddle.matmul(q1, k1.transpose([0, 1, 3, 2])) * scale
+        attn_w2 = paddle.matmul(q2, k2.transpose([0, 1, 3, 2])) * scale
+
+        if attention_mask is not None:
+            attn_w1 = attn_w1 + attention_mask
+            attn_w2 = attn_w2 + attention_mask
+
+        attn_w1 = F.softmax(attn_w1, axis=-1, dtype='float32').cast(q.dtype)
+        attn_w2 = F.softmax(attn_w2, axis=-1, dtype='float32').cast(q.dtype)
+
+        attn11 = paddle.matmul(attn_w1, v1)
+        attn12 = paddle.matmul(attn_w1, v2)
+        attn21 = paddle.matmul(attn_w2, v1)
+        attn22 = paddle.matmul(attn_w2, v2)
+
+        attn1 = paddle.concat([attn11, attn12], axis=-1)
+        attn2 = paddle.concat([attn21, attn22], axis=-1)
+
+        lambda_1 = paddle.exp(
+            (self.lambda_q1.cast(q.dtype) * self.lambda_k1.cast(q.dtype)).sum()
+        )
+        lambda_2 = paddle.exp(
+            (self.lambda_q2.cast(q.dtype) * self.lambda_k2.cast(q.dtype)).sum()
+        )
+        lambda_full = lambda_1 - lambda_2 + self.lambda_init
+
+        attn = attn1 - lambda_full * attn2
+        attn = self.subln(attn) * (1 - self.lambda_init)
+
+        attn = attn.reshape([bsz, n_heads // 2, seqlen, 2, head_dim])
+        attn = attn.transpose([0, 1, 3, 2, 4]).reshape([bsz, n_heads, seqlen, head_dim])
+        return attn
 
 
 class Phi4MLP(nn.Layer):
@@ -150,6 +240,7 @@ class Phi4Attention(nn.Layer):
             self.Wqkv = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias_attr=True)
         else:
             self.Wqkv = nn.Linear(self.hidden_size, op_size, bias_attr=True)
+        self.inner_cross_attn = Phi4DiffAttention(self.head_dim, self.layer_idx)
 
     def _repeat_kv(self, hidden_states, n_rep):
         batch, num_key_value_heads, slen, head_dim = hidden_states.shape
@@ -196,23 +287,16 @@ class Phi4Attention(nn.Layer):
                 key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
 
         yoco_key_values = key_states, value_states
-        
-        key_states = self._repeat_kv(key_states, self.num_key_value_groups)
-        value_states = self._repeat_kv(value_states, self.num_key_value_groups)
 
-        attn_weights = paddle.matmul(query_states, key_states.transpose([0, 1, 3, 2])) / math.sqrt(self.head_dim)
-
+        causal_mask = None
         if attention_mask is not None:
             if attention_mask.ndim == 4:
-                causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
+                causal_mask = attention_mask[:, :, :, :key_states.shape[-2]]
             else:
                 causal_mask = attention_mask
-            attn_weights = attn_weights + causal_mask
 
-        attn_weights = F.softmax(attn_weights, axis=-1, dtype="float32").cast(query_states.dtype)
-        attn_weights = F.dropout(attn_weights, p=self.attention_dropout, training=self.training)
-
-        attn_output = paddle.matmul(attn_weights, value_states)
+        attn_output = self.inner_cross_attn(query_states, key_states, value_states, attention_mask=causal_mask)
+        attn_output = F.dropout(attn_output, p=self.attention_dropout, training=self.training)
         attn_output = attn_output.transpose([0, 2, 1, 3]).reshape([bsz, q_len, self.hidden_size])
         attn_output = self.out_proj(attn_output)
 
@@ -318,25 +402,24 @@ class Phi4Mamba(nn.Layer):
             if self.yoco_kv:
                 z = z.transpose([0, 2, 1])
             if mask is not None:
-                x = x * mask.unsqueeze(1)
+                x = x * mask.unsqueeze(1).astype(x.dtype)
 
             if conv_state is not None:
                 conv_state_update = F.pad(x, [self.d_conv - x.shape[-1], 0])
                 conv_state.set_value(conv_state_update.astype(conv_state.dtype))
 
-            # Convert x to float32 for conv1d (weight is float32)
-            x_float32 = x.astype('float32')
-            x = self.act(self.conv1d(x_float32)[..., :seqlen]).astype(x.dtype)
+            x_conv = x.astype(self.conv1d.weight.dtype)
+            x = self.act(self.conv1d(x_conv)[..., :seqlen]).astype(x.dtype)
 
             if mask is not None:
-                x = x * mask.unsqueeze(1)
+                x = x * mask.unsqueeze(1).astype(x.dtype)
 
             x_dbl = self.x_proj(x.transpose([0, 2, 1]).reshape([batch * seqlen, self.d_inner]))
             dt = x_dbl[:, :self.dt_rank]
             B = x_dbl[:, self.dt_rank:self.dt_rank + self.d_state]
             C = x_dbl[:, self.dt_rank + self.d_state:]
 
-            dt = paddle.matmul(self.dt_proj.weight, dt.T)
+            dt = paddle.matmul(dt, self.dt_proj.weight).T
             dt = dt.T.reshape([batch, seqlen, self.d_inner]).transpose([0, 2, 1])
             B = B.reshape([batch, seqlen, self.d_state]).transpose([0, 2, 1])
             C = C.reshape([batch, seqlen, self.d_state]).transpose([0, 2, 1])
@@ -351,7 +434,7 @@ class Phi4Mamba(nn.Layer):
             y = y.transpose([0, 2, 1])
             if self.yoco_kv:
                 yoco_key_values = y
-                y = swiglu(z.transpose([0, 2, 1]), y)
+                y = swiglu(z, y)
             out = self.out_proj(y)
         
         return out, yoco_key_values
@@ -361,36 +444,37 @@ class Phi4Mamba(nn.Layer):
         assert hidden_states.shape[1] == 1, "Only support decoding with 1 token at a time"
         xz = self.in_proj(hidden_states.squeeze(1))
         x, z = paddle.chunk(xz, 2, axis=-1)
-        
+
         conv_state_new = paddle.roll(conv_state, shifts=-1, axis=-1)
         conv_state_new[:, :, -1] = x
         conv_state.set_value(conv_state_new)
-        
-        x_conv = paddle.sum(conv_state * self.conv1d.weight.squeeze(1), axis=-1)
+
+        x_conv = paddle.sum(conv_state * self.conv1d.weight.squeeze(1).astype(dtype), axis=-1)
         if self.conv1d.bias is not None:
-            x_conv = x_conv + self.conv1d.bias
-        x = self.act(x_conv).astype(dtype)
-        
+            x_conv = x_conv + self.conv1d.bias.astype(dtype)
+        x = self.act(x_conv)
+
         x_db = self.x_proj(x)
         dt, B, C = paddle.split(x_db, [self.dt_rank, self.d_state, self.d_state], axis=-1)
-        dt = paddle.matmul(dt, self.dt_proj.weight.T)
-        A = -paddle.exp(self.A_log.astype('float32'))
-        
-        dt = F.softplus(dt + self.dt_proj.bias.astype(dt.dtype))
+        # dt_proj.weight shape is [dt_rank, d_inner] (paddle [in, out] convention, AOA-transposed)
+        dt = paddle.matmul(dt, self.dt_proj.weight)
+        A = -paddle.exp(self.A_log).astype(dtype)
+
+        dt = F.softplus(dt + self.dt_proj.bias.astype(dtype))
         dA = paddle.exp(paddle.einsum('bd,dn->bdn', dt, A))
-        dB = paddle.einsum('bd,bn->bdn', dt, B)
-        ssm_state_new = ssm_state * dA + x.unsqueeze(2) * dB
+        dB = paddle.einsum('bd,bn->bdn', dt.astype(dtype), B.astype(dtype))
+        ssm_state_new = ssm_state.astype(dtype) * dA + x.unsqueeze(2) * dB
         ssm_state.set_value(ssm_state_new)
-        
+
         y = paddle.einsum('bdn,bn->bd', ssm_state.astype(dtype), C)
         y = y + self.D.astype(dtype) * x
-        
+
         if self.yoco_kv:
             yoco_key_values = y.unsqueeze(1)
             y = swiglu(z, y)
         else:
             y = y * self.act(z)
-        
+
         out = self.out_proj(y.unsqueeze(1))
         return out, None, None, yoco_key_values
 
@@ -533,6 +617,7 @@ class Phi4DecoderLayer(nn.Layer):
                 "d_conv": config.mamba_d_conv,
                 "d_state": config.mamba_d_state,
                 "expand": config.mamba_expand,
+                "use_fast_path": False,
                 "dtype": None
             }
             self.attn = Phi4Mamba(
@@ -563,25 +648,18 @@ class Phi4DecoderLayer(nn.Layer):
         **kwargs,
     ):
         residual = hidden_states
-        hidden_states = self.input_layernorm(hidden_states.astype(self.input_layernorm.weight.dtype))
+        hidden_dtype = hidden_states.dtype
+        hidden_states = self.input_layernorm(hidden_states.astype(self.input_layernorm.weight.dtype)).astype(hidden_dtype)
 
         if self.use_mamba:
-            try:
-                attn_outputs, yoco_key_values = self.attn(
-                    hidden_states=hidden_states,
-                    inference_params=past_key_value,
-                    mask=attention_mask,
-                    yoco_key_values=yoco_key_values,
-                    cache_position=cache_position,
-                )
-                self_attn_weights = None
-            except NotImplementedError as e:
-                raise NotImplementedError(
-                    f"Mamba layer forward failed at layer {self.layer_idx}: {str(e)}. "
-                    "Mamba SSM requires porting CUDA kernels (selective_scan_cuda, causal_conv1d_cuda). "
-                    "To use this model, either: 1) Set config.mb_per_layer=0 to disable Mamba layers, "
-                    "or 2) Implement the required CUDA kernels for PaddlePaddle."
-                )
+            attn_outputs, ssm_output = self.attn(
+                hidden_states=hidden_states,
+                inference_params=past_key_value,
+                mask=attention_mask,
+                yoco_key_values=ssm_output,
+                cache_position=cache_position,
+            )
+            self_attn_weights = None
         else:
             if (
                 self.config.sliding_window is not None
@@ -605,7 +683,8 @@ class Phi4DecoderLayer(nn.Layer):
         hidden_states = residual + self.resid_attn_dropout(attn_outputs)
 
         residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states.astype(self.post_attention_layernorm.weight.dtype))
+        hidden_dtype = hidden_states.dtype
+        hidden_states = self.post_attention_layernorm(hidden_states.astype(self.post_attention_layernorm.weight.dtype)).astype(hidden_dtype)
         hidden_states = self.mlp(hidden_states)
         hidden_states = residual + self.resid_mlp_dropout(hidden_states)
 
@@ -621,13 +700,18 @@ class Phi4DecoderLayer(nn.Layer):
 class Phi4PretrainedModel(PretrainedModel):
     config_class = Phi4Config
     base_model_prefix = "model"
+    transpose_weight_keys = [
+        "fc1", "fc2",
+        "Wqkv", "out_proj",
+        "in_proj", "x_proj", "dt_proj",
+    ]
 
     @classmethod
     def _gen_aoa_config(cls, config: Phi4Config):
-        """Generate AOA (Array of Arrays) config for weight loading from HuggingFace format."""
-        model_prefix = "" if cls == cls.base_model_class else "model."
+        model_prefix = cls.base_model_prefix + "." if cls != cls.base_model_class else ""
+        num_layers = config.num_hidden_layers
+        yoco_cross_start = num_layers // 2 + 2
 
-        # Common mappings for all layers
         aoa_statements = [
             f"model.embed_tokens.weight -> {model_prefix}embed_tokens.weight",
             f"model.final_layernorm.weight -> {model_prefix}final_layernorm.weight",
@@ -640,34 +724,40 @@ class Phi4PretrainedModel(PretrainedModel):
             f"model.layers.$LAYER_ID.mlp.fc2.weight^T -> {model_prefix}layers.$LAYER_ID.mlp.fc2.weight",
         ]
 
-        # Layer-specific mappings (Mamba vs Attention layers)
-        for layer_id in range(config.num_hidden_layers):
-            is_mamba_layer = (config.mb_per_layer > 0 and layer_id % config.mb_per_layer == 0)
+        for layer_id in range(num_layers):
+            is_mamba = config.mb_per_layer > 0 and layer_id % config.mb_per_layer == 0
+            is_yoco_cross = layer_id >= yoco_cross_start
 
-            if is_mamba_layer:
-                # Mamba layer mappings
-                aoa_statements.append(
-                    f"model.layers.{layer_id}.attn.in_proj.weight -> {model_prefix}layers.{layer_id}.attn.in_proj.weight"
-                )
-                aoa_statements.append(
-                    f"model.layers.{layer_id}.attn.out_proj.weight^T -> {model_prefix}layers.{layer_id}.attn.out_proj.weight"
-                )
+            if is_mamba and not is_yoco_cross:
+                aoa_statements.extend([
+                    f"model.layers.{layer_id}.attn.A_log -> {model_prefix}layers.{layer_id}.attn.A_log",
+                    f"model.layers.{layer_id}.attn.D -> {model_prefix}layers.{layer_id}.attn.D",
+                    f"model.layers.{layer_id}.attn.conv1d.bias -> {model_prefix}layers.{layer_id}.attn.conv1d.bias",
+                    f"model.layers.{layer_id}.attn.conv1d.weight -> {model_prefix}layers.{layer_id}.attn.conv1d.weight",
+                    f"model.layers.{layer_id}.attn.dt_proj.bias -> {model_prefix}layers.{layer_id}.attn.dt_proj.bias",
+                    f"model.layers.{layer_id}.attn.dt_proj.weight^T -> {model_prefix}layers.{layer_id}.attn.dt_proj.weight",
+                    f"model.layers.{layer_id}.attn.in_proj.weight^T -> {model_prefix}layers.{layer_id}.attn.in_proj.weight",
+                    f"model.layers.{layer_id}.attn.out_proj.weight^T -> {model_prefix}layers.{layer_id}.attn.out_proj.weight",
+                    f"model.layers.{layer_id}.attn.x_proj.weight^T -> {model_prefix}layers.{layer_id}.attn.x_proj.weight",
+                ])
+            elif is_mamba and is_yoco_cross:
+                aoa_statements.extend([
+                    f"model.layers.{layer_id}.attn.in_proj.weight^T -> {model_prefix}layers.{layer_id}.attn.in_proj.weight",
+                    f"model.layers.{layer_id}.attn.out_proj.weight^T -> {model_prefix}layers.{layer_id}.attn.out_proj.weight",
+                ])
             else:
-                # Attention layer mappings (with Wqkv)
-                aoa_statements.append(
-                    f"model.layers.{layer_id}.attn.Wqkv.weight -> {model_prefix}layers.{layer_id}.attn.Wqkv.weight"
-                )
-                aoa_statements.append(
-                    f"model.layers.{layer_id}.attn.Wqkv.bias -> {model_prefix}layers.{layer_id}.attn.Wqkv.bias"
-                )
-                aoa_statements.append(
-                    f"model.layers.{layer_id}.attn.out_proj.weight^T -> {model_prefix}layers.{layer_id}.attn.out_proj.weight"
-                )
-                aoa_statements.append(
-                    f"model.layers.{layer_id}.attn.out_proj.bias -> {model_prefix}layers.{layer_id}.attn.out_proj.bias"
-                )
+                aoa_statements.extend([
+                    f"model.layers.{layer_id}.attn.Wqkv.weight^T -> {model_prefix}layers.{layer_id}.attn.Wqkv.weight",
+                    f"model.layers.{layer_id}.attn.Wqkv.bias -> {model_prefix}layers.{layer_id}.attn.Wqkv.bias",
+                    f"model.layers.{layer_id}.attn.out_proj.weight^T -> {model_prefix}layers.{layer_id}.attn.out_proj.weight",
+                    f"model.layers.{layer_id}.attn.out_proj.bias -> {model_prefix}layers.{layer_id}.attn.out_proj.bias",
+                    f"model.layers.{layer_id}.attn.inner_cross_attn.lambda_q1 -> {model_prefix}layers.{layer_id}.attn.inner_cross_attn.lambda_q1",
+                    f"model.layers.{layer_id}.attn.inner_cross_attn.lambda_k1 -> {model_prefix}layers.{layer_id}.attn.inner_cross_attn.lambda_k1",
+                    f"model.layers.{layer_id}.attn.inner_cross_attn.lambda_q2 -> {model_prefix}layers.{layer_id}.attn.inner_cross_attn.lambda_q2",
+                    f"model.layers.{layer_id}.attn.inner_cross_attn.lambda_k2 -> {model_prefix}layers.{layer_id}.attn.inner_cross_attn.lambda_k2",
+                    f"model.layers.{layer_id}.attn.inner_cross_attn.subln.weight -> {model_prefix}layers.{layer_id}.attn.inner_cross_attn.subln.weight",
+                ])
 
-        # For Phi4ForCausalLM (not Phi4Model), handle lm_head
         if cls != cls.base_model_class:
             if config.tie_word_embeddings:
                 aoa_statements.append("model.embed_tokens.weight -> lm_head.weight")
@@ -826,7 +916,8 @@ class Phi4Model(Phi4PretrainedModel):
             if output_attentions:
                 all_self_attns += (layer_outputs[3],)
 
-        hidden_states = self.final_layernorm(hidden_states.astype(self.final_layernorm.weight.dtype))
+        hidden_dtype = hidden_states.dtype
+        hidden_states = self.final_layernorm(hidden_states.astype(self.final_layernorm.weight.dtype)).astype(hidden_dtype)
 
         if output_hidden_states:
             all_hidden_states += (hidden_states,)

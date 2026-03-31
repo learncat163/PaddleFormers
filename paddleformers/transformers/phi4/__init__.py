@@ -23,11 +23,13 @@ import_structure = {
         "Phi4Model",
         "Phi4ForCausalLM",
     ],
+    "tokenizer": ["Phi4Tokenizer"],
 }
 
 if TYPE_CHECKING:
     from .configuration import *
     from .modeling import *
+    from .tokenizer import *
 else:
     sys.modules[__name__] = _LazyModule(
         __name__,
