@@ -30,20 +30,10 @@ from ...utils.log import logger
 
 
 def swiglu(x, y):
-    """
-    SwiGLU activation function: x * y * sigmoid(x)
-    Reference: https://arxiv.org/abs/2002.05202
-    """
-    return x * y * F.sigmoid(x)
+    return y * F.silu(x)
 
 
 def selective_scan_paddle(x, dt, A, B, C, D, z=None, delta_bias=None, delta_softplus=True):
-    # x: (batch, d_inner, seq_len)
-    # dt: (batch, d_inner, seq_len)
-    # A: (d_inner, d_state)
-    # B: (batch, d_state, seq_len)
-    # C: (batch, d_state, seq_len)
-    # D: (d_inner,)
     batch, d_inner, seq_len = x.shape
     _, d_state, _ = B.shape
     orig_dtype = x.dtype
@@ -137,8 +127,6 @@ class Phi4DiffAttention(nn.Layer):
         return x.reshape([batch, n_heads * n_rep, slen, head_dim])
 
     def forward(self, q, k, v, attention_mask=None):
-        # q: (B, H, S, D), k: (B, H_kv, S, D), v: (B, H_kv, S, D)
-        # Returns: (B, H, S, D)
         bsz, n_heads, seqlen, head_dim = q.shape
         n_kv_heads = k.shape[1]
         n_rep = n_heads // n_kv_heads
@@ -194,19 +182,13 @@ class Phi4DiffAttention(nn.Layer):
 class Phi4MLP(nn.Layer):
     def __init__(self, config: Phi4Config):
         super().__init__()
-        self.config = config
         self.fc1 = nn.Linear(config.hidden_size, 2 * config.intermediate_size, bias_attr=False)
         self.fc2 = nn.Linear(config.intermediate_size, config.hidden_size, bias_attr=False)
-        self.activation_fn = nn.Silu()
 
     def forward(self, hidden_states):
         y = self.fc1(hidden_states)
         gate, y = paddle.chunk(y, 2, axis=-1)
-        if self.config.hidden_act == "silu":
-            y = swiglu(gate, y)
-        else:
-            y = y * self.activation_fn(gate)
-        return self.fc2(y)
+        return self.fc2(y * F.silu(gate))
 
 class Phi4Attention(nn.Layer):
     def __init__(self, config: Phi4Config, layer_idx: Optional[int] = None, yoco_cross: bool = False):
@@ -242,13 +224,6 @@ class Phi4Attention(nn.Layer):
             self.Wqkv = nn.Linear(self.hidden_size, op_size, bias_attr=True)
         self.inner_cross_attn = Phi4DiffAttention(self.head_dim, self.layer_idx)
 
-    def _repeat_kv(self, hidden_states, n_rep):
-        batch, num_key_value_heads, slen, head_dim = hidden_states.shape
-        if n_rep == 1:
-            return hidden_states
-        hidden_states = hidden_states.unsqueeze(2).tile([1, 1, n_rep, 1, 1])
-        return hidden_states.reshape([batch, num_key_value_heads * n_rep, slen, head_dim])
-
     def forward(
         self,
         hidden_states,
@@ -262,13 +237,11 @@ class Phi4Attention(nn.Layer):
         **kwargs,
     ):
         bsz, q_len, _ = hidden_states.shape
-        
+
         if self.yoco_cross:
-            q = self.Wqkv(hidden_states)
-            q = q.reshape([bsz, q_len, self.num_heads, self.head_dim]).transpose([0, 2, 1, 3])
+            query_states = self.Wqkv(hidden_states)
+            query_states = query_states.reshape([bsz, q_len, self.num_heads, self.head_dim]).transpose([0, 2, 1, 3])
             key_states, value_states = yoco_key_values
-            query_states = q
-            use_sliding_windows = False
         else:
             qkv = self.Wqkv(hidden_states)
             query_pos = self.num_heads * self.head_dim
@@ -279,8 +252,6 @@ class Phi4Attention(nn.Layer):
             query_states = query_states.reshape([bsz, q_len, self.num_heads, self.head_dim]).transpose([0, 2, 1, 3])
             key_states = key_states.reshape([bsz, q_len, self.num_key_value_heads, self.head_dim]).transpose([0, 2, 1, 3])
             value_states = value_states.reshape([bsz, q_len, self.num_key_value_heads, self.head_dim]).transpose([0, 2, 1, 3])
-
-            use_sliding_windows = self.config.sliding_window is not None and self.config.sliding_window[self.layer_idx] is not None
 
             if past_key_value is not None:
                 cache_kwargs = {"cache_position": cache_position}
@@ -394,7 +365,6 @@ class Phi4Mamba(nn.Layer):
 
         A = -paddle.exp(self.A_log.astype('float32'))
 
-        # Disable fast path if inference_params is None (use_cache=False) to avoid CUDA kernel requirement
         if (not self.yoco_kv) and self.use_fast_path and (inference_params is not None):
             raise NotImplementedError("Mamba fast path requires selective_scan_cuda kernel")
         else:
@@ -456,7 +426,6 @@ class Phi4Mamba(nn.Layer):
 
         x_db = self.x_proj(x)
         dt, B, C = paddle.split(x_db, [self.dt_rank, self.d_state, self.d_state], axis=-1)
-        # dt_proj.weight shape is [dt_rank, d_inner] (paddle [in, out] convention, AOA-transposed)
         dt = paddle.matmul(dt, self.dt_proj.weight)
         A = -paddle.exp(self.A_log).astype(dtype)
 
@@ -484,8 +453,6 @@ class Phi4Mamba(nn.Layer):
         return conv_state, ssm_state
 
 
-#//FIXME-ISPL: Full SambaY混合缓存机制需要适配（sliding window + global attention + mamba states）
-# 当前实现：使用纯 PaddlePaddle 实现混合缓存，包括 sliding window 和 Mamba states
 class Phi4Cache:
     def __init__(
         self,
@@ -526,10 +493,6 @@ class Phi4Cache:
             else:
                 self.key_cache.append(None)
                 self.value_cache.append(None)
-
-    @property
-    def max_batch_size(self):
-        return self._max_batch_size
 
     @property
     def max_batch_size(self):
@@ -862,7 +825,6 @@ class Phi4Model(Phi4PretrainedModel):
             )
 
         if attention_mask is not None and use_cache and not self.training:
-            # Only check for padding_right if seq_len > 1 (for single token inputs, padding direction doesn't matter)
             seq_len = attention_mask.shape[1]
             if seq_len > 1:
                 is_padding_right = attention_mask[:, -1].sum().item() != batch_size
