@@ -2,8 +2,8 @@ import paddle
 import sys
 sys.path.insert(0, '/home/cao/code/github/PaddleFormers')
 
-from paddleformers.transformers.phi4.configuration import Phi4Config
-from paddleformers.transformers.phi4.modeling import (
+from paddleformers.transformers import Phi4Config
+from paddleformers.transformers import (
     Phi4Model, 
     Phi4ForCausalLM,
     Phi4Attention,

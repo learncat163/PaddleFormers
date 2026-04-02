@@ -12,19 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import unittest
-import tempfile
-import shutil
-import os
-import sys
 import gc
+import os
+import shutil
+import tempfile
+import unittest
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
-
-import paddle
 import numpy as np
+import paddle
 
-from paddleformers.transformers.phi4 import Phi4ForCausalLM, Phi4Config, Phi4Model
+from paddleformers.transformers import Phi4ForCausalLM, Phi4Tokenizer
 
 
 class TestPhi4Modeling(unittest.TestCase):
@@ -162,20 +159,29 @@ class TestPhi4Modeling(unittest.TestCase):
         input_ids_paddle = paddle.to_tensor(ref_input_ids[np.newaxis, :], dtype='int64')
 
         layer0_output_list = []
+        last_layer_output_list = []
 
-        def hook_fn(layer, input, output):
+        def hook_fn_layer0(layer, input, output):
             if isinstance(output, (tuple, list)):
                 layer0_output_list.append(output[0].detach().cast('float32').cpu().numpy())
             else:
                 layer0_output_list.append(output.detach().cast('float32').cpu().numpy())
 
-        hook_handle = self.model.model.layers[0].register_forward_post_hook(hook_fn)
+        def hook_fn_last(layer, input, output):
+            if isinstance(output, (tuple, list)):
+                last_layer_output_list.append(output[0].detach().cast('float32').cpu().numpy())
+            else:
+                last_layer_output_list.append(output.detach().cast('float32').cpu().numpy())
+
+        hook_handle = self.model.model.layers[0].register_forward_post_hook(hook_fn_layer0)
+        hook_handle_last = self.model.model.layers[-1].register_forward_post_hook(hook_fn_last)
 
         try:
             with paddle.no_grad():
                 outputs = self.model(input_ids=input_ids_paddle, use_cache=False)
         finally:
             hook_handle.remove()
+            hook_handle_last.remove()
 
         self.assertTrue(len(layer0_output_list) > 0, "Hook did not capture layer0 output")
         paddle_layer0 = layer0_output_list[0]
@@ -208,6 +214,24 @@ class TestPhi4Modeling(unittest.TestCase):
                         f"Layer0 max diff {max_diff:.6f} exceeds 5e-2 threshold (bfloat16 range)")
         self.assertLess(mean_diff, 5e-3,
                         f"Layer0 mean diff {mean_diff:.6f} exceeds 5e-3 threshold")
+
+        if len(last_layer_output_list) > 0 and "last_layer_full" in ref_data:
+            paddle_last = last_layer_output_list[0]
+            ref_last = ref_data["last_layer_full"]
+            if ref_last.ndim == 2:
+                ref_last = ref_last[np.newaxis, :]
+            print(f"\nPaddle last_layer shape: {paddle_last.shape}")
+            print(f"PyTorch last_layer shape: {ref_last.shape}")
+            print(f"Paddle last_layer[0, 0, :20] = {paddle_last[0, 0, :20].tolist()}")
+            print(f"PyTorch last_layer[0, 0, :20] = {ref_last[0, 0, :20].tolist()}")
+            last_abs_diff = np.abs(paddle_last - ref_last)
+            last_max_diff = float(last_abs_diff.max())
+            last_mean_diff = float(last_abs_diff.mean())
+            print(f"\nLast layer diff stats (observation only, no constraint):")
+            print(f"  max_diff  = {last_max_diff:.6f}")
+            print(f"  mean_diff = {last_mean_diff:.6f}")
+        else:
+            print("\nSkipping last layer diff: no reference data or hook not triggered")
 
         logits = outputs[0] if isinstance(outputs, (tuple, list)) else outputs.logits
         greedy_ids = []
@@ -247,6 +271,360 @@ class TestPhi4BF16Optimization(unittest.TestCase):
     
     def test_bf16_forward_speed(self):
         self.skipTest("BF16 forward speed test skipped: AOA engine does not support paddle.bfloat16 dtype")
+
+class TestPhi4InferenceUseHf(unittest.TestCase):
+    model_path = "/mnt/caoyuanye/llm/microsoft/Phi-4-mini-flash-reasoning"
+    model = None
+    tokenizer = None
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tokenizer = Phi4Tokenizer.from_pretrained(cls.model_path)
+        cls.model = Phi4ForCausalLM.from_pretrained(
+            cls.model_path,
+            dtype='bfloat16',
+            convert_from_hf=True,
+        )
+        cls.model.eval()
+
+    @classmethod
+    def tearDownClass(cls):
+        del cls.model
+        del cls.tokenizer
+        cls.model = None
+        cls.tokenizer = None
+        gc.collect()
+        try:
+            paddle.device.cuda.empty_cache()
+        except Exception:
+            pass
+
+    def test_inference_cat_vs_dog(self):
+        messages = [{"role": "user", "content": "猫和狗的区别是什么"}]
+        input_text = self.tokenizer.apply_chat_template(
+            messages,
+            add_generation_prompt=True,
+            tokenize=False,
+        )
+        inputs = self.tokenizer(input_text, return_tensors="pd")
+        input_ids = inputs["input_ids"]
+
+        with paddle.no_grad():
+            output_ids = self.model.generate(
+                input_ids=input_ids,
+                max_new_tokens=256,
+                do_sample=False,
+                temperature=1.0,
+                eos_token_id=self.tokenizer.eos_token_id,
+                pad_token_id=self.tokenizer.pad_token_id,
+            )[0]
+
+        new_tokens = output_ids[0][input_ids.shape[1]:]
+        response = self.tokenizer.decode(new_tokens, skip_special_tokens=True)
+        self.assertIsInstance(response, str)
+        self.assertGreater(len(response), 0)
+        print(f"\n{'='*60}")
+        print(f"Input: 猫和狗的区别是什么")
+        print(f"{'='*60}")
+        print(f"Output:\n{response}")
+        print(f"{'='*60}")
+
+
+class TestPhi4InferenceUsePaddle(unittest.TestCase):
+    model_path = os.path.expanduser("~/llm/aistudio/Phi-4-mini-flash-reasoning-paddle")
+    model = None
+    tokenizer = None
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tokenizer = Phi4Tokenizer.from_pretrained(cls.model_path)
+        cls.model = Phi4ForCausalLM.from_pretrained(
+            cls.model_path,
+            dtype='bfloat16',
+            convert_from_hf=False,
+        )
+        cls.model.eval()
+
+    @classmethod
+    def tearDownClass(cls):
+        del cls.model
+        del cls.tokenizer
+        cls.model = None
+        cls.tokenizer = None
+        gc.collect()
+        try:
+            paddle.device.cuda.empty_cache()
+        except Exception:
+            pass
+
+    def test_inference_cat_vs_dog(self):
+        messages = [{"role": "user", "content": "猫和狗的区别是什么"}]
+        input_text = self.tokenizer.apply_chat_template(
+            messages,
+            add_generation_prompt=True,
+            tokenize=False,
+        )
+        inputs = self.tokenizer(input_text, return_tensors="pd")
+        input_ids = inputs["input_ids"]
+
+        with paddle.no_grad():
+            output_ids = self.model.generate(
+                input_ids=input_ids,
+                max_new_tokens=256,
+                do_sample=False,
+                temperature=1.0,
+                eos_token_id=self.tokenizer.eos_token_id,
+                pad_token_id=self.tokenizer.pad_token_id,
+            )[0]
+
+        new_tokens = output_ids[0][input_ids.shape[1]:]
+        response = self.tokenizer.decode(new_tokens, skip_special_tokens=True)
+        self.assertIsInstance(response, str)
+        self.assertGreater(len(response), 0)
+        print(f"\n{'='*60}")
+        print(f"Input: 猫和狗的区别是什么")
+        print(f"{'='*60}")
+        print(f"Output:\n{response}")
+        print(f"{'='*60}")
+
+    def test_manual_greedy_no_cache(self):
+        messages = [{"role": "user", "content": "猫和狗的区别是什么"}]
+        input_text = self.tokenizer.apply_chat_template(
+            messages,
+            add_generation_prompt=True,
+            tokenize=False,
+        )
+        inputs = self.tokenizer(input_text, return_tensors="pd")
+        cur_ids = inputs["input_ids"]
+
+        generated = []
+        eos_id = self.tokenizer.eos_token_id
+        for _ in range(30):
+            with paddle.no_grad():
+                out = self.model(input_ids=cur_ids, use_cache=False)
+            lgt = out[0] if isinstance(out, (tuple, list)) else out.logits
+            next_id = int(lgt[0, -1, :].argmax().item())
+            generated.append(next_id)
+            if next_id == eos_id:
+                break
+            cur_ids = paddle.concat([cur_ids, paddle.to_tensor([[next_id]], dtype='int64')], axis=1)
+
+        response = self.tokenizer.decode(generated, skip_special_tokens=True)
+        print(f"\n{'='*60}")
+        print(f"[manual greedy, use_cache=False, 30 steps]")
+        print(f"token ids: {generated}")
+        print(f"Output:\n{response}")
+        print(f"{'='*60}")
+        self.assertIsInstance(response, str)
+
+    def test_manual_greedy_with_cache(self):
+        messages = [{"role": "user", "content": "猫和狗的区别是什么"}]
+        input_text = self.tokenizer.apply_chat_template(
+            messages,
+            add_generation_prompt=True,
+            tokenize=False,
+        )
+        inputs = self.tokenizer(input_text, return_tensors="pd")
+        cur_ids = inputs["input_ids"]
+
+        generated = []
+        eos_id = self.tokenizer.eos_token_id
+        past_key_values = None
+        for step in range(30):
+            with paddle.no_grad():
+                out = self.model(
+                    input_ids=cur_ids if step == 0 else paddle.to_tensor([[generated[-1]]], dtype='int64'),
+                    use_cache=True,
+                    past_key_values=past_key_values,
+                )
+            if hasattr(out, 'logits'):
+                lgt = out.logits
+                past_key_values = out.past_key_values
+            else:
+                lgt = out[0]
+                past_key_values = out[1] if len(out) > 1 else None
+            next_id = int(lgt[0, -1, :].argmax().item())
+            generated.append(next_id)
+            if next_id == eos_id:
+                break
+
+        response = self.tokenizer.decode(generated, skip_special_tokens=True)
+        print(f"\n{'='*60}")
+        print(f"[manual greedy, use_cache=True, 30 steps]")
+        print(f"token ids: {generated}")
+        print(f"Output:\n{response}")
+        print(f"{'='*60}")
+        self.assertIsInstance(response, str)
+
+
+class TestPhi4LayerDiffAlignment(unittest.TestCase):
+    """
+    Layer-level diff alignment test: compare paddle vs PyTorch reference outputs.
+
+    PyTorch reference generated by phi4 env:
+        python .claude/ai_history/ph4mini/diff/scripts/gen_layer_reference.py
+    Saved to: tmp/layer0_reference.npz
+
+    PyTorch script (phi4 env):
+        messages = [
+            {"role": "system", "content": "You are a helpful assistant. Do not use <think> tags."},
+            {"role": "user", "content": "猫和狗的区别是什么"},
+        ]
+        inputs = tokenizer.apply_chat_template(messages, add_generation_prompt=True, ...)
+        # input_ids shape: [1, 25]
+        # layer0 hook: model.model.layers[0].register_forward_hook(hook_fn_layer0)
+        # last_layer hook: model.model.layers[-1].register_forward_hook(hook_fn_last)
+        # prefill with use_cache=False, then greedy generate 10 tokens with do_sample=False
+        # torch.manual_seed(42), model dtype=bfloat16
+    """
+
+    model = None
+    model_path = "/mnt/caoyuanye/llm/microsoft/Phi-4-mini-flash-reasoning"
+    ref_path = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))),
+        "tmp", "layer0_reference.npz"
+    )
+
+    @classmethod
+    def setUpClass(cls):
+        if not os.path.exists(cls.ref_path):
+            return
+        cls.model = Phi4ForCausalLM.from_pretrained(
+            cls.model_path,
+            dtype='bfloat16',
+            convert_from_hf=True,
+        )
+        cls.model.eval()
+
+    @classmethod
+    def tearDownClass(cls):
+        del cls.model
+        cls.model = None
+        gc.collect()
+        try:
+            paddle.device.cuda.empty_cache()
+        except Exception:
+            pass
+
+    def _require_ref(self):
+        if not os.path.exists(self.ref_path):
+            self.skipTest(f"Reference data not found: {self.ref_path}")
+        if self.model is None:
+            self.skipTest("Model not loaded (ref data missing at setUpClass)")
+
+    def test_layer0_diff(self):
+        self._require_ref()
+        ref = np.load(self.ref_path)
+        input_ids_np = ref["input_ids"]
+        ref_layer0 = ref["layer0_full"]
+        if ref_layer0.ndim == 2:
+            ref_layer0 = ref_layer0[np.newaxis, :]
+
+        input_ids = paddle.to_tensor(input_ids_np[np.newaxis, :], dtype='int64')
+
+        captured = []
+
+        def hook_fn(layer, args, output):
+            if isinstance(output, (tuple, list)):
+                captured.append(output[0].detach().cast('float32').cpu().numpy())
+            else:
+                captured.append(output.detach().cast('float32').cpu().numpy())
+
+        h = self.model.model.layers[0].register_forward_post_hook(hook_fn)
+        try:
+            with paddle.no_grad():
+                self.model(input_ids=input_ids, use_cache=False)
+        finally:
+            h.remove()
+
+        self.assertTrue(len(captured) > 0, "Hook did not capture layer0 output")
+        paddle_layer0 = captured[0]
+
+        print(f"\nPaddle  layer0 shape: {paddle_layer0.shape}")
+        print(f"PyTorch layer0 shape: {ref_layer0.shape}")
+        print(f"Paddle  layer0[0, 0, :20] = {paddle_layer0[0, 0, :20].tolist()}")
+        print(f"PyTorch layer0[0, 0, :20] = {ref_layer0[0, 0, :20].tolist()}")
+
+        self.assertEqual(list(paddle_layer0.shape), list(ref_layer0.shape),
+                         f"Shape mismatch: {paddle_layer0.shape} vs {ref_layer0.shape}")
+
+        diff = np.abs(paddle_layer0 - ref_layer0)
+        max_diff = float(diff.max())
+        mean_diff = float(diff.mean())
+        print(f"\nLayer0 diff: max={max_diff:.6f}, mean={mean_diff:.6f}")
+
+        # bfloat16 precision ~1/128=0.0078; for values in range [-0.4, 0.4] max quantization error ~0.05
+        self.assertLess(max_diff, 5e-2,
+                        f"Layer0 max_diff {max_diff:.6f} exceeds 5e-2 (bfloat16, system+user prompt)")
+        self.assertLess(mean_diff, 5e-3,
+                        f"Layer0 mean_diff {mean_diff:.6f} exceeds 5e-3")
+
+    def test_last_layer_diff_observe(self):
+        self._require_ref()
+        ref = np.load(self.ref_path)
+        if "last_layer_full" not in ref:
+            self.skipTest("last_layer_full not in reference data")
+
+        input_ids_np = ref["input_ids"]
+        ref_last = ref["last_layer_full"]
+        if ref_last.ndim == 2:
+            ref_last = ref_last[np.newaxis, :]
+
+        input_ids = paddle.to_tensor(input_ids_np[np.newaxis, :], dtype='int64')
+
+        captured = []
+
+        def hook_fn(layer, args, output):
+            if isinstance(output, (tuple, list)):
+                captured.append(output[0].detach().cast('float32').cpu().numpy())
+            else:
+                captured.append(output.detach().cast('float32').cpu().numpy())
+
+        h = self.model.model.layers[-1].register_forward_post_hook(hook_fn)
+        try:
+            with paddle.no_grad():
+                self.model(input_ids=input_ids, use_cache=False)
+        finally:
+            h.remove()
+
+        if not captured:
+            self.skipTest("Last layer hook not triggered")
+
+        paddle_last = captured[0]
+        print(f"\nPaddle  last_layer shape: {paddle_last.shape}")
+        print(f"PyTorch last_layer shape: {ref_last.shape}")
+        print(f"Paddle  last_layer[0, 0, :20] = {paddle_last[0, 0, :20].tolist()}")
+        print(f"PyTorch last_layer[0, 0, :20] = {ref_last[0, 0, :20].tolist()}")
+
+        diff = np.abs(paddle_last - ref_last)
+        max_diff = float(diff.max())
+        mean_diff = float(diff.mean())
+        print(f"\nLast layer diff (observation only): max={max_diff:.6f}, mean={mean_diff:.6f}")
+
+    def test_greedy_token_ids(self):
+        self._require_ref()
+        ref = np.load(self.ref_path)
+        input_ids_np = ref["input_ids"]
+        ref_token_ids = ref["new_token_ids"].tolist()
+
+        cur_ids = paddle.to_tensor(input_ids_np[np.newaxis, :], dtype='int64')
+        greedy_ids = []
+        for _ in range(10):
+            with paddle.no_grad():
+                out = self.model(input_ids=cur_ids, use_cache=False)
+            lgt = out[0] if isinstance(out, (tuple, list)) else out.logits
+            next_id = int(lgt[0, -1, :].argmax().item())
+            greedy_ids.append(next_id)
+            cur_ids = paddle.concat([cur_ids, paddle.to_tensor([[next_id]], dtype='int64')], axis=1)
+
+        print(f"\nPaddle  greedy ids: {greedy_ids}")
+        print(f"PyTorch greedy ids: {ref_token_ids}")
+
+        match = sum(a == b for a, b in zip(greedy_ids, ref_token_ids))
+        print(f"Token match: {match}/{len(ref_token_ids)}")
+
+        self.assertGreaterEqual(match, int(len(ref_token_ids) * 0.8),
+                                f"Token match too low: {match}/{len(ref_token_ids)}")
 
 
 def run_tests():
