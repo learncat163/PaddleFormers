@@ -52,13 +52,16 @@ CONFIG_MAPPING_NAMES = OrderedDict(
         ("qwen3_vl_moe", "Qwen3VLMoeConfig"),
         ("qwen3_vl_moe_text", "Qwen3VLMoeTextConfig"),
         ("glm4_moe", "Glm4MoeConfig"),
+        ("glm_moe_dsa", "GlmMoeDsaConfig"),
         ("gpt_oss", "GptOssConfig"),
         ("phi3", "Phi3Config"),
-        ("phi4", "Phi4Config"),
-        ("phi4flash", "Phi4Config"),  # phi4flash is an alias for phi4
         ("gemma3_text", "Gemma3TextConfig"),
         ("glm4v_moe", "Glm4vMoeConfig"),
         ("glm_ocr", "GlmOcrConfig"),
+        ("qwen3_5", "Qwen3_5Config"),
+        ("qwen3_5_moe", "Qwen3_5MoEConfig"),
+        ("phi4", "Phi4Config"),
+        ("phi4flash", "Phi4Config"),
     ]
 )
 
@@ -85,9 +88,10 @@ MODEL_NAMES_MAPPING = OrderedDict(
         ("qwen3_vl_moe", "Qwen3VLMoe"),
         ("qwen3_vl_moe_text", "Qwen3VLMoeText"),
         ("glm_ocr", "GlmOcrForConditionalGeneration"),
-        ("phi3", "Phi3ForCausalLM"),
+        ("qwen3_5_moe", "Qwen3_5MoEForConditionalGeneration"),
+        ("qwen3_5", "Qwen3_5ForConditionalGeneration"),
         ("phi4", "Phi4ForCausalLM"),
-        ("phi4flash", "Phi4ForCausalLM"),  #
+        ("phi4flash", "Phi4ForCausalLM"),
     ]
 )
 
@@ -101,7 +105,7 @@ SPECIAL_MODEL_TYPE_TO_MODULE_NAME = OrderedDict(
         ("qwen2_5_vl_text", "qwen2_5_vl"),
         ("qwen3_vl_text", "qwen3_vl"),
         ("qwen3_vl_moe_text", "qwen3_vl_moe"),
-        ("phi4flash", "phi4"),  # phi4flash uses the phi4 module
+        ("phi4flash", "phi4"),
     ]
 )
 
