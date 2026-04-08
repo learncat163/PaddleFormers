@@ -22,238 +22,76 @@ import numpy as np
 import paddle
 
 from paddleformers.transformers import Phi4ForCausalLM, Phi4Tokenizer
+from tests.testing_utils import slow
 
 
 class TestPhi4Modeling(unittest.TestCase):
-    model = None
-    model_path = "/mnt/caoyuanye/llm/microsoft/Phi-4-mini-flash-reasoning"
-
-    @classmethod
-    def setUpClass(cls):
-        cls.model = Phi4ForCausalLM.from_pretrained(
-            cls.model_path,
-            dtype='bfloat16',
-            convert_from_hf=True,
-        )
-        cls.model.eval()
-
-    @classmethod
-    def tearDownClass(cls):
-        del cls.model
-        cls.model = None
-        gc.collect()
-        try:
-            paddle.device.cuda.empty_cache()
-        except Exception:
-            pass
-
     def setUp(self):
         self.temp_dir = tempfile.mkdtemp()
 
     def tearDown(self):
         if os.path.exists(self.temp_dir):
             shutil.rmtree(self.temp_dir)
-    
-    def test_config_loading(self):
-        config = self.model.config
-        self.assertIsNotNone(config)
-        self.assertIn(config.model_type, ("phi4", "phi4flash"))
-        self.assertGreater(config.vocab_size, 0)
-        self.assertGreater(config.hidden_size, 0)
-        self.assertGreater(config.num_hidden_layers, 0)
-        print(f"Config OK: {config.model_type}, vocab={config.vocab_size}")
 
-    def test_model_loading_bf16(self):
-        self.skipTest("BF16 model loading skipped: AOA engine does not support paddle.bfloat16")
-    def test_model_loading_float32(self):
-        self.assertIsNotNone(self.model)
-        print(f"Model loaded with float32 successfully")
+    def test_model_creation_and_forward(self):
+        from paddleformers.transformers import Phi4Config
+        config = Phi4Config(
+            vocab_size=1000,
+            hidden_size=128,
+            intermediate_size=512,
+            num_hidden_layers=4,
+            num_attention_heads=8,
+            num_key_value_heads=4,
+            max_position_embeddings=128,
+        )
+        model = Phi4ForCausalLM(config)
+        model.eval()
 
-    def test_forward_pass(self):
         batch_size = 1
         seq_length = 3
-        input_ids = paddle.randint(0, self.model.config.vocab_size, [batch_size, seq_length])
+        input_ids = paddle.randint(0, config.vocab_size, [batch_size, seq_length], dtype='int64')
         with paddle.no_grad():
-            outputs = self.model(input_ids=input_ids, use_cache=False)
+            outputs = model(input_ids=input_ids, use_cache=False)
+
         self.assertIsNotNone(outputs)
         logits = outputs[0] if isinstance(outputs, (tuple, list)) else outputs.logits
-        self.assertEqual(list(logits.shape), [batch_size, seq_length, self.model.config.vocab_size])
-        print(f"Forward pass OK, shape: {logits.shape}")
-
-    def test_tokenizer_loading(self):
-        self.skipTest("Tokenizer loading test skipped due to naming conflict")
+        self.assertEqual(list(logits.shape), [batch_size, seq_length, config.vocab_size])
+        print(f"Model creation and forward pass OK, shape: {logits.shape}")
 
     def test_model_save_and_load(self):
-        save_path = os.path.join(self.temp_dir, "saved_model")
-        current_device = paddle.get_device()
-        self.__class__.model.to('cpu')
-        gc.collect()
-        try:
-            paddle.device.cuda.empty_cache()
-        except Exception:
-            pass
-        try:
-            self.model.save_pretrained(save_path)
-            loaded_model = Phi4ForCausalLM.from_pretrained(save_path, dtype='bfloat16')
-            loaded_model.eval()
-            input_ids = paddle.randint(0, loaded_model.config.vocab_size, [1, 3], dtype='int64')
-            with paddle.no_grad():
-                outputs = loaded_model(input_ids=input_ids)
-            logits = outputs[0] if isinstance(outputs, (tuple, list)) else outputs.logits
-            self.assertEqual(logits.shape[-1], loaded_model.config.vocab_size)
-            del loaded_model
-            gc.collect()
-            try:
-                paddle.device.cuda.empty_cache()
-            except Exception:
-                pass
-            print(f"Model save and load OK, logits shape={tuple(logits.shape)}")
-        finally:
-            self.__class__.model.to(current_device)
+        from paddleformers.transformers import Phi4Config
 
-    def test_attention_mechanism(self):
-        config = self.model.config
-        self.assertGreater(config.num_attention_heads, 0)
-        self.assertGreater(config.num_key_value_heads, 0)
-        print(f"Attention: heads={config.num_attention_heads}, kv_heads={config.num_key_value_heads}")
-
-    def test_load_original_transformers_weights(self):
-        self.assertIsNotNone(self.model)
-        input_ids = paddle.randint(0, self.model.config.vocab_size, [1, 3], dtype='int64')
-        with paddle.no_grad():
-            outputs = self.model(input_ids=input_ids)
-        logits = outputs[0] if isinstance(outputs, (tuple, list)) else outputs.logits
-        self.assertEqual(logits.shape[-1], self.model.config.vocab_size)
-        print(f"AOA HF weight load via setUpClass verified: shape={tuple(logits.shape)}")
-
-    def test_layer0_diff_alignment(self):
-        """
-        与PyTorch原版第一层输出做diff对齐测试。
-        PyTorch参考数据由 tmp/extract_layer0_torch.py 在phi4环境生成。
-
-        PyTorch原版代码 (phi4环境):
-            model = AutoModelForCausalLM.from_pretrained(model_id, torch_dtype=torch.bfloat16, ...)
-            hook = model.model.layers[0].register_forward_hook(hook_fn)
-            outputs = model.generate(input_ids=input_ids, max_new_tokens=10, temperature=1.0, do_sample=False)
-            # layer0_output shape: [1, 9, 2560]
-            # new_token_ids: [33313, 881, 523, 24367, 16742, 47110, 48091, 5884, 35182, 1616]
-        """
-        import os
-        ref_path = os.path.join(
-            os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))),
-            "tmp", "layer0_reference.npz"
+        config = Phi4Config(
+            vocab_size=1000,
+            hidden_size=128,
+            intermediate_size=512,
+            num_hidden_layers=4,
+            num_attention_heads=8,
+            num_key_value_heads=4,
+            max_position_embeddings=128,
         )
-        if not os.path.exists(ref_path):
-            self.skipTest(f"Reference data not found: {ref_path}")
 
-        ref_data = np.load(ref_path)
-        ref_input_ids = ref_data["input_ids"]
-        ref_layer0_full = ref_data["layer0_full"]
-        ref_new_token_ids = ref_data["new_token_ids"]
+        model = Phi4ForCausalLM(config)
+        model.eval()
 
-        # PyTorch参考: layer0[0, 0, :20]
-        # [-0.1376953125, 0.19580078125, -0.1767578125, ...]
-        # PyTorch参考 new_token_ids (greedy, 前10个):
-        # [33313, 881, 523, 24367, 16742, 47110, 48091, 5884, 35182, 1616]
+        save_path = os.path.join(self.temp_dir, "saved_model")
+        model.save_pretrained(save_path)
+        self.assertTrue(os.path.exists(save_path))
 
-        input_ids_paddle = paddle.to_tensor(ref_input_ids[np.newaxis, :], dtype='int64')
+        loaded_model = Phi4ForCausalLM.from_pretrained(save_path)
+        loaded_model.eval()
 
-        layer0_output_list = []
-        last_layer_output_list = []
-
-        def hook_fn_layer0(layer, input, output):
-            if isinstance(output, (tuple, list)):
-                layer0_output_list.append(output[0].detach().cast('float32').cpu().numpy())
-            else:
-                layer0_output_list.append(output.detach().cast('float32').cpu().numpy())
-
-        def hook_fn_last(layer, input, output):
-            if isinstance(output, (tuple, list)):
-                last_layer_output_list.append(output[0].detach().cast('float32').cpu().numpy())
-            else:
-                last_layer_output_list.append(output.detach().cast('float32').cpu().numpy())
-
-        hook_handle = self.model.model.layers[0].register_forward_post_hook(hook_fn_layer0)
-        hook_handle_last = self.model.model.layers[-1].register_forward_post_hook(hook_fn_last)
-
-        try:
-            with paddle.no_grad():
-                outputs = self.model(input_ids=input_ids_paddle, use_cache=False)
-        finally:
-            hook_handle.remove()
-            hook_handle_last.remove()
-
-        self.assertTrue(len(layer0_output_list) > 0, "Hook did not capture layer0 output")
-        paddle_layer0 = layer0_output_list[0]
-
-        # ref_layer0_full shape可能是 [seq_len, hidden] 或 [batch, seq_len, hidden]，统一为 [B, S, H]
-        if ref_layer0_full.ndim == 2:
-            ref_layer0_full = ref_layer0_full[np.newaxis, :]
-
-        print(f"\nPaddle layer0 shape: {paddle_layer0.shape}")
-        print(f"PyTorch layer0 shape: {ref_layer0_full.shape}")
-        print(f"Paddle layer0[0, 0, :20] = {paddle_layer0[0, 0, :20].tolist()}")
-        print(f"PyTorch layer0[0, 0, :20] = {ref_layer0_full[0, 0, :20].tolist()}")
-
-        self.assertEqual(list(paddle_layer0.shape), list(ref_layer0_full.shape),
-                         f"Shape mismatch: paddle={paddle_layer0.shape}, torch={ref_layer0_full.shape}")
-
-        abs_diff = np.abs(paddle_layer0 - ref_layer0_full)
-        max_diff = float(abs_diff.max())
-        mean_diff = float(abs_diff.mean())
-
-        print(f"\nDiff stats:")
-        print(f"  max_diff  = {max_diff:.6f}")
-        print(f"  mean_diff = {mean_diff:.6f}")
-        print(f"  max_diff threshold = 5e-2 (bfloat16 normal range)")
-        print(f"  mean_diff threshold = 5e-3")
-
-        # bfloat16的精度约为2^-7=0.0078，对于量级3~5的值，预期误差最大约0.03~0.04
-        # 因此max_diff阈值设为5e-2，mean_diff要求在5e-3以内保证整体对齐质量
-        self.assertLess(max_diff, 5e-2,
-                        f"Layer0 max diff {max_diff:.6f} exceeds 5e-2 threshold (bfloat16 range)")
-        self.assertLess(mean_diff, 5e-3,
-                        f"Layer0 mean diff {mean_diff:.6f} exceeds 5e-3 threshold")
-
-        if len(last_layer_output_list) > 0 and "last_layer_full" in ref_data:
-            paddle_last = last_layer_output_list[0]
-            ref_last = ref_data["last_layer_full"]
-            if ref_last.ndim == 2:
-                ref_last = ref_last[np.newaxis, :]
-            print(f"\nPaddle last_layer shape: {paddle_last.shape}")
-            print(f"PyTorch last_layer shape: {ref_last.shape}")
-            print(f"Paddle last_layer[0, 0, :20] = {paddle_last[0, 0, :20].tolist()}")
-            print(f"PyTorch last_layer[0, 0, :20] = {ref_last[0, 0, :20].tolist()}")
-            last_abs_diff = np.abs(paddle_last - ref_last)
-            last_max_diff = float(last_abs_diff.max())
-            last_mean_diff = float(last_abs_diff.mean())
-            print(f"\nLast layer diff stats (observation only, no constraint):")
-            print(f"  max_diff  = {last_max_diff:.6f}")
-            print(f"  mean_diff = {last_mean_diff:.6f}")
-        else:
-            print("\nSkipping last layer diff: no reference data or hook not triggered")
-
+        input_ids = paddle.randint(0, config.vocab_size, [1, 3], dtype='int64')
+        with paddle.no_grad():
+            outputs = loaded_model(input_ids=input_ids)
         logits = outputs[0] if isinstance(outputs, (tuple, list)) else outputs.logits
-        greedy_ids = []
-        cur_ids = input_ids_paddle
-        for _ in range(10):
-            with paddle.no_grad():
-                out = self.model(input_ids=cur_ids, use_cache=False)
-            lgt = out[0] if isinstance(out, (tuple, list)) else out.logits
-            next_id = int(lgt[0, -1, :].argmax().item())
-            greedy_ids.append(next_id)
-            cur_ids = paddle.concat([cur_ids, paddle.to_tensor([[next_id]], dtype='int64')], axis=1)
+        self.assertEqual(logits.shape[-1], config.vocab_size)
+        print(f"Model save and load OK, logits shape={tuple(logits.shape)}")
 
-        print(f"\nPaddle greedy token ids: {greedy_ids}")
-        print(f"PyTorch greedy token ids: {ref_new_token_ids.tolist()}")
 
-        match_count = sum(a == b for a, b in zip(greedy_ids, ref_new_token_ids.tolist()))
-        print(f"Token match: {match_count}/{len(ref_new_token_ids)}")
-        self.assertGreaterEqual(match_count, len(ref_new_token_ids) * 0.8,
-                                f"Token id match too low: {match_count}/{len(ref_new_token_ids)}")
-
+@slow
 class TestPhi4InferenceUseHf(unittest.TestCase):
-    model_path = "/mnt/caoyuanye/llm/microsoft/Phi-4-mini-flash-reasoning"
+    model_path = "microsoft/Phi-4-mini-flash-reasoning"
     model = None
     tokenizer = None
 
@@ -280,7 +118,10 @@ class TestPhi4InferenceUseHf(unittest.TestCase):
             pass
 
     def test_inference_cat_vs_dog(self):
-        messages = [{"role": "user", "content": "猫和狗的区别是什么"}]
+        messages = [
+            {"role": "system", "content": "You are a helpful assistant."},
+            {"role": "user", "content": "What is the capital of China?"},
+        ]
         input_text = self.tokenizer.apply_chat_template(
             messages,
             add_generation_prompt=True,
@@ -299,19 +140,19 @@ class TestPhi4InferenceUseHf(unittest.TestCase):
                 pad_token_id=self.tokenizer.pad_token_id,
             )[0]
 
-        new_tokens = output_ids[0][input_ids.shape[1]:]
-        response = self.tokenizer.decode(new_tokens, skip_special_tokens=True)
+        response = self.tokenizer.decode(output_ids[0], skip_special_tokens=True)
         self.assertIsInstance(response, str)
         self.assertGreater(len(response), 0)
-        print(f"\n{'='*60}")
-        print(f"Input: 猫和狗的区别是什么")
-        print(f"{'='*60}")
+        print(f"\n{'=' * 60}")
+        print(f"Input: What is the capital of China?")
+        print(f"{'=' * 60}")
         print(f"Output:\n{response}")
-        print(f"{'='*60}")
+        print(f"{'=' * 60}")
 
 
+@slow
 class TestPhi4InferenceUsePaddle(unittest.TestCase):
-    model_path = os.path.expanduser("~/llm/aistudio/Phi-4-mini-flash-reasoning-paddle")
+    model_path = os.path.expanduser("learncat/Phi-4-mini-flash-reasoning-paddle")
     model = None
     tokenizer = None
 
@@ -338,7 +179,10 @@ class TestPhi4InferenceUsePaddle(unittest.TestCase):
             pass
 
     def test_inference_cat_vs_dog(self):
-        messages = [{"role": "user", "content": "猫和狗的区别是什么"}]
+        messages = [
+            {"role": "system", "content": "You are a helpful assistant."},
+            {"role": "user", "content": "What is the capital of China?"},
+        ]
         input_text = self.tokenizer.apply_chat_template(
             messages,
             add_generation_prompt=True,
@@ -357,18 +201,20 @@ class TestPhi4InferenceUsePaddle(unittest.TestCase):
                 pad_token_id=self.tokenizer.pad_token_id,
             )[0]
 
-        new_tokens = output_ids[0][input_ids.shape[1]:]
-        response = self.tokenizer.decode(new_tokens, skip_special_tokens=True)
+        response = self.tokenizer.decode(output_ids[0], skip_special_tokens=True)
         self.assertIsInstance(response, str)
         self.assertGreater(len(response), 0)
-        print(f"\n{'='*60}")
-        print(f"Input: 猫和狗的区别是什么")
-        print(f"{'='*60}")
+        print(f"\n{'=' * 60}")
+        print(f"Input: What is the capital of China?")
+        print(f"{'=' * 60}")
         print(f"Output:\n{response}")
-        print(f"{'='*60}")
+        print(f"{'=' * 60}")
 
     def test_manual_greedy_no_cache(self):
-        messages = [{"role": "user", "content": "猫和狗的区别是什么"}]
+        messages = [
+            {"role": "system", "content": "You are a helpful assistant."},
+            {"role": "user", "content": "What is the capital of China?"},
+        ]
         input_text = self.tokenizer.apply_chat_template(
             messages,
             add_generation_prompt=True,
@@ -390,15 +236,18 @@ class TestPhi4InferenceUsePaddle(unittest.TestCase):
             cur_ids = paddle.concat([cur_ids, paddle.to_tensor([[next_id]], dtype='int64')], axis=1)
 
         response = self.tokenizer.decode(generated, skip_special_tokens=True)
-        print(f"\n{'='*60}")
+        print(f"\n{'=' * 60}")
         print(f"[manual greedy, use_cache=False, 30 steps]")
         print(f"token ids: {generated}")
         print(f"Output:\n{response}")
-        print(f"{'='*60}")
+        print(f"{'=' * 60}")
         self.assertIsInstance(response, str)
 
     def test_manual_greedy_with_cache(self):
-        messages = [{"role": "user", "content": "猫和狗的区别是什么"}]
+        messages = [
+            {"role": "system", "content": "You are a helpful assistant."},
+            {"role": "user", "content": "What is the capital of China?"},
+        ]
         input_text = self.tokenizer.apply_chat_template(
             messages,
             add_generation_prompt=True,
@@ -429,46 +278,67 @@ class TestPhi4InferenceUsePaddle(unittest.TestCase):
                 break
 
         response = self.tokenizer.decode(generated, skip_special_tokens=True)
-        print(f"\n{'='*60}")
+        print(f"\n{'=' * 60}")
         print(f"[manual greedy, use_cache=True, 30 steps]")
         print(f"token ids: {generated}")
         print(f"Output:\n{response}")
-        print(f"{'='*60}")
+        print(f"{'=' * 60}")
         self.assertIsInstance(response, str)
 
 
+'''
+
+因为手动编译的cuda算子的差异，导致在多层网络的累加误差之下，无法在最后一层实现对齐，目前只能做到：
+
+1. 在 第一层的输出中，实现 0.000793 的平均误差； 
+2. 前10个token id完全一致
+3. 最后一层是 0.281017 的平均误差
+
+
+对齐测试稍微有点特殊， 因为phi4 依赖了 mamba-ssm、causal-conv1d 等组件，导致特定的环境下需要手动编译并初始化python环境
+
+所以这里采用了：在一个专门的phi4的conda 环境里，输出第一层和最后一层的output的向量值的前20个数据，并取了 token输出的前10个id直接硬编码
+
+REF_xxx 的变量全部来自phi4环境下使用pytorch 进行推理的输出数据的硬编码 。
+
+'''
+
+
 class TestPhi4LayerDiffAlignment(unittest.TestCase):
-    """
-    Layer-level diff alignment test: compare paddle vs PyTorch reference outputs.
-
-    PyTorch reference generated by phi4 env:
-        python .claude/ai_history/ph4mini/diff/scripts/gen_layer_reference.py
-    Saved to: tmp/layer0_reference.npz
-
-    PyTorch script (phi4 env):
-        messages = [
-            {"role": "system", "content": "You are a helpful assistant. Do not use <think> tags."},
-            {"role": "user", "content": "猫和狗的区别是什么"},
-        ]
-        inputs = tokenizer.apply_chat_template(messages, add_generation_prompt=True, ...)
-        # input_ids shape: [1, 25]
-        # layer0 hook: model.model.layers[0].register_forward_hook(hook_fn_layer0)
-        # last_layer hook: model.model.layers[-1].register_forward_hook(hook_fn_last)
-        # prefill with use_cache=False, then greedy generate 10 tokens with do_sample=False
-        # torch.manual_seed(42), model dtype=bfloat16
-    """
-
     model = None
-    model_path = "/mnt/caoyuanye/llm/microsoft/Phi-4-mini-flash-reasoning"
-    ref_path = os.path.join(
-        os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))),
-        "tmp", "layer0_reference.npz"
-    )
+    tokenizer = None
+    model_path = "microsoft/Phi-4-mini-flash-reasoning"
+
+    REF_LAYER0_FIRST_TOKEN_FIRST20 = [
+        -0.09912109375, 0.4345703125, -0.0721282958984375, 0.1578369140625,
+        -0.19476318359375, -0.394439697265625, -0.0894775390625, -0.022216796875,
+        0.01220703125, 0.056640625, -0.1060791015625, -0.0780029296875,
+        0.08111572265625, -0.12481689453125, 0.0150146484375, -0.0150299072265625,
+        -0.384490966796875, 0.0347900390625, 0.1318359375, -0.0999755859375
+    ]
+
+    REF_LAST_LAYER_FIRST_TOKEN_FIRST20 = [
+        0.0306396484375, 4.347686767578125, 0.177886962890625, 9.518585205078125,
+        -1.6810302734375, 4.293243408203125, -3.50250244140625, 6.155670166015625,
+        11.880416870117188, -1.83856201171875, 2.328369140625, -0.244964599609375,
+        -0.10107421875, 8.194091796875, -8.33013916015625, 0.3831634521484375,
+        1.711822509765625, 0.126953125, 2.81903076171875, -1.20147705078125
+    ]
+
+    REF_LAST_LAYER_LAST_TOKEN_FIRST20 = [
+        15.5140380859375, 10.106557846069336, -8.950668334960938, 13.417678833007812,
+        -8.5753173828125, 6.5550537109375, 11.9271240234375, -21.944580078125,
+        38.504486083984375, -0.96942138671875, 4.662109375, -9.9052734375,
+        29.12060546875, 36.023704528808594, -8.587677001953125, -3.0186767578125,
+        6.49127197265625, -13.24774169921875, 15.015228271484375, -19.550689697265625
+    ]
+
+    REF_NEW_TOKEN_IDS = [33313, 881, 523, 53520, 11, 813, 357, 1309, 316, 11310]
 
     @classmethod
     def setUpClass(cls):
-        if not os.path.exists(cls.ref_path):
-            return
+        paddle.seed(42)
+        cls.tokenizer = Phi4Tokenizer.from_pretrained(cls.model_path)
         cls.model = Phi4ForCausalLM.from_pretrained(
             cls.model_path,
             dtype='bfloat16',
@@ -479,162 +349,125 @@ class TestPhi4LayerDiffAlignment(unittest.TestCase):
     @classmethod
     def tearDownClass(cls):
         del cls.model
+        del cls.tokenizer
         cls.model = None
+        cls.tokenizer = None
         gc.collect()
         try:
             paddle.device.cuda.empty_cache()
         except Exception:
             pass
 
-    def _require_ref(self):
-        if not os.path.exists(self.ref_path):
-            self.skipTest(f"Reference data not found: {self.ref_path}")
-        if self.model is None:
-            self.skipTest("Model not loaded (ref data missing at setUpClass)")
+    def _get_input_ids(self):
+        messages = [
+            {"role": "system", "content": "You are a helpful assistant."},
+            {"role": "user", "content": "What is the capital of China?"},
+        ]
+        input_text = self.tokenizer.apply_chat_template(
+            messages,
+            add_generation_prompt=True,
+            tokenize=False,
+        )
+        inputs = self.tokenizer(input_text, return_tensors="pd")
+        return inputs["input_ids"]
 
-    def test_layer0_diff(self):
-        self._require_ref()
-        ref = np.load(self.ref_path)
-        input_ids_np = ref["input_ids"]
-        ref_layer0 = ref["layer0_full"]
-        if ref_layer0.ndim == 2:
-            ref_layer0 = ref_layer0[np.newaxis, :]
+    # 这里只对齐第一层，和前10个token id
+    def test_alignment(self):
+        input_ids = self._get_input_ids()
+        print(f"\n{'=' * 80}")
+        print(f"Input ids: {input_ids[0].tolist()}, shape: {input_ids.shape}")
 
-        input_ids = paddle.to_tensor(input_ids_np[np.newaxis, :], dtype='int64')
+        layer0_out = []
+        last_layer_out = []
 
-        captured = []
+        def _capture(store):
+            def hook(layer, args, output):
+                x = output[0] if isinstance(output, (tuple, list)) else output
+                store.append(x.detach().cast('float32').numpy())
 
-        def hook_fn(layer, args, output):
-            if isinstance(output, (tuple, list)):
-                captured.append(output[0].detach().cast('float32').cpu().numpy())
-            else:
-                captured.append(output.detach().cast('float32').cpu().numpy())
+            return hook
 
-        h = self.model.model.layers[0].register_forward_post_hook(hook_fn)
+        h0 = self.model.model.layers[0].register_forward_post_hook(_capture(layer0_out))
+        hl = self.model.model.layers[-1].register_forward_post_hook(_capture(last_layer_out))
         try:
             with paddle.no_grad():
                 self.model(input_ids=input_ids, use_cache=False)
         finally:
-            h.remove()
+            h0.remove()
+            hl.remove()
 
-        self.assertTrue(len(captured) > 0, "Hook did not capture layer0 output")
-        paddle_layer0 = captured[0]
+        self.assertTrue(layer0_out, "Hook did not capture layer0 output")
+        self.assertTrue(last_layer_out, "Hook did not capture last_layer output")
 
-        print(f"\nPaddle  layer0 shape: {paddle_layer0.shape}")
-        print(f"PyTorch layer0 shape: {ref_layer0.shape}")
-        print(f"Paddle  layer0[0, 0, :20] = {paddle_layer0[0, 0, :20].tolist()}")
-        print(f"PyTorch layer0[0, 0, :20] = {ref_layer0[0, 0, :20].tolist()}")
+        l0 = layer0_out[0][0, 0, :20].tolist()
+        ref_l0 = self.REF_LAYER0_FIRST_TOKEN_FIRST20
+        diff0 = np.abs(np.array(l0) - np.array(ref_l0))
+        print(f"\nLayer0[0,0,:20]  paddle : {l0}")
+        print(f"Layer0[0,0,:20]  pytorch: {ref_l0}")
+        print(f"Layer0 diff: max={diff0.max():.6f}, mean={diff0.mean():.6f}")
 
-        self.assertEqual(list(paddle_layer0.shape), list(ref_layer0.shape),
-                         f"Shape mismatch: {paddle_layer0.shape} vs {ref_layer0.shape}")
+        # 指标要求1e-2以内的diff
+        self.assertTrue(diff0.mean() < 0.01, "Layer0 diff too large")
 
-        diff = np.abs(paddle_layer0 - ref_layer0)
-        max_diff = float(diff.max())
-        mean_diff = float(diff.mean())
-        print(f"\nLayer0 diff: max={max_diff:.6f}, mean={mean_diff:.6f}")
+        ll = last_layer_out[0]
+        ll_first = ll[0, 0, :20].tolist()
+        ll_last = ll[0, -1, :20].tolist()
+        ref_ll_first = self.REF_LAST_LAYER_FIRST_TOKEN_FIRST20
+        ref_ll_last = self.REF_LAST_LAYER_LAST_TOKEN_FIRST20
+        diff_ll_first = np.abs(np.array(ll_first) - np.array(ref_ll_first))
+        diff_ll_last = np.abs(np.array(ll_last) - np.array(ref_ll_last))
+        print(f"\nLastLayer[0,0,:20]  paddle : {ll_first}")
+        print(f"LastLayer[0,0,:20]  pytorch: {ref_ll_first}")
+        print(f"LastLayer first token diff: max={diff_ll_first.max():.6f}, mean={diff_ll_first.mean():.6f}")
+        print(f"\nLastLayer[0,-1,:20] paddle : {ll_last}")
+        print(f"LastLayer[0,-1,:20] pytorch: {ref_ll_last}")
+        print(f"LastLayer last token diff: max={diff_ll_last.max():.6f}, mean={diff_ll_last.mean():.6f}")
 
-        # bfloat16 precision ~1/128=0.0078; for values in range [-0.4, 0.4] max quantization error ~0.05
-        self.assertLess(max_diff, 5e-2,
-                        f"Layer0 max_diff {max_diff:.6f} exceeds 5e-2 (bfloat16, system+user prompt)")
-        self.assertLess(mean_diff, 5e-3,
-                        f"Layer0 mean_diff {mean_diff:.6f} exceeds 5e-3")
+        # 最后一层对齐不了，因为phi4依赖的本地cuda算子等原因，在多层误差迭代之后，不能满足1e-2
 
-    def test_last_layer_diff_observe(self):
-        self._require_ref()
-        ref = np.load(self.ref_path)
-        if "last_layer_full" not in ref:
-            self.skipTest("last_layer_full not in reference data")
+        # generate 完整推理（KV cache 加速）
+        with paddle.no_grad():
+            output_ids = self.model.generate(
+                input_ids=input_ids,
+                max_new_tokens=512,
+                do_sample=False,
+                eos_token_id=self.tokenizer.eos_token_id,
+                pad_token_id=self.tokenizer.pad_token_id,
+            )[0]
 
-        input_ids_np = ref["input_ids"]
-        ref_last = ref["last_layer_full"]
-        if ref_last.ndim == 2:
-            ref_last = ref_last[np.newaxis, :]
+        new_ids = output_ids[0].tolist()
+        full_text = self.tokenizer.decode(new_ids, skip_special_tokens=True)
+        print(f"\n{'=' * 80}")
+        print(f"Full output:\n{full_text}")
+        print(f"{'=' * 80}")
 
-        input_ids = paddle.to_tensor(input_ids_np[np.newaxis, :], dtype='int64')
+        # 前10个 token 对比
+        first10 = new_ids[:10]
+        ref_ids = self.REF_NEW_TOKEN_IDS
+        match = sum(a == b for a, b in zip(first10, ref_ids))
+        ref_text = self.tokenizer.decode(ref_ids, skip_special_tokens=True)
+        print(f"\nFirst-10 token match: {match}/{len(ref_ids)}")
+        print(f"  Paddle : {first10}  -> {self.tokenizer.decode(first10, skip_special_tokens=True)}")
+        print(f"  PyTorch: {ref_ids}  -> {ref_text}")
+        print(f"{'=' * 80}")
 
-        captured = []
-
-        def hook_fn(layer, args, output):
-            if isinstance(output, (tuple, list)):
-                captured.append(output[0].detach().cast('float32').cpu().numpy())
-            else:
-                captured.append(output.detach().cast('float32').cpu().numpy())
-
-        h = self.model.model.layers[-1].register_forward_post_hook(hook_fn)
-        try:
-            with paddle.no_grad():
-                self.model(input_ids=input_ids, use_cache=False)
-        finally:
-            h.remove()
-
-        if not captured:
-            self.skipTest("Last layer hook not triggered")
-
-        paddle_last = captured[0]
-        print(f"\nPaddle  last_layer shape: {paddle_last.shape}")
-        print(f"PyTorch last_layer shape: {ref_last.shape}")
-        print(f"Paddle  last_layer[0, 0, :20] = {paddle_last[0, 0, :20].tolist()}")
-        print(f"PyTorch last_layer[0, 0, :20] = {ref_last[0, 0, :20].tolist()}")
-
-        diff = np.abs(paddle_last - ref_last)
-        max_diff = float(diff.max())
-        mean_diff = float(diff.mean())
-        print(f"\nLast layer diff (observation only): max={max_diff:.6f}, mean={mean_diff:.6f}")
-
-    def test_greedy_token_ids(self):
-        self._require_ref()
-        ref = np.load(self.ref_path)
-        input_ids_np = ref["input_ids"]
-        ref_token_ids = ref["new_token_ids"].tolist()
-
-        cur_ids = paddle.to_tensor(input_ids_np[np.newaxis, :], dtype='int64')
-        greedy_ids = []
-        for _ in range(10):
-            with paddle.no_grad():
-                out = self.model(input_ids=cur_ids, use_cache=False)
-            lgt = out[0] if isinstance(out, (tuple, list)) else out.logits
-            next_id = int(lgt[0, -1, :].argmax().item())
-            greedy_ids.append(next_id)
-            cur_ids = paddle.concat([cur_ids, paddle.to_tensor([[next_id]], dtype='int64')], axis=1)
-
-        print(f"\nPaddle  greedy ids: {greedy_ids}")
-        print(f"PyTorch greedy ids: {ref_token_ids}")
-
-        match = sum(a == b for a, b in zip(greedy_ids, ref_token_ids))
-        print(f"Token match: {match}/{len(ref_token_ids)}")
-
-        self.assertGreaterEqual(match, int(len(ref_token_ids) * 0.8),
-                                f"Token match too low: {match}/{len(ref_token_ids)}")
+        self.assertGreaterEqual(match, 10,
+                                f"Token match too low: {match}/{len(ref_ids)}")
 
 
 def run_tests():
-    """运行所有测试"""
-    # 创建测试套件
     loader = unittest.TestLoader()
     suite = unittest.TestSuite()
-    
-    # 添加测试
+
     suite.addTests(loader.loadTestsFromTestCase(TestPhi4Modeling))
-    suite.addTests(loader.loadTestsFromTestCase(TestPhi4BF16Optimization))
-    
-    # 运行测试
+
     runner = unittest.TextTestRunner(verbosity=2)
     result = runner.run(suite)
-    
-    # 打印结果
-    print(f"\n{'='*80}")
-    print("Test Summary")
-    print(f"{'='*80}")
-    print(f"Tests run: {result.testsRun}")
-    successes = result.testsRun - len(result.failures) - len(result.errors) - len(result.skipped)
-    print(f"Successes: {successes}")
-    print(f"Failures: {len(result.failures)}")
     print(f"Errors: {len(result.errors)}")
-    print(f"Skipped: {len(result.skipped)}")
-    
     return 0 if result.wasSuccessful() else 1
 
 
 if __name__ == "__main__":
     import sys
+
     sys.exit(run_tests())

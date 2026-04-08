@@ -24,16 +24,18 @@ from paddle.distributed.fleet.utils import recompute
 from .configuration import Phi4Config
 from ..model_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast
 from ..model_utils import PretrainedModel, register_base_model
+from ...generation.utils import _make_sliding_window_mask
 from ...nn.criterion.interface import CriterionLayer
 from ...nn.lm_head import LMHead as GeneralLMHead
 from ...utils.log import logger
+from ...utils.masking_utils import _make_causal_mask, _expand_2d_mask
 
 
 def swiglu(x, y):
     return y * F.silu(x)
 
 
-def selective_scan_paddle(x, dt, A, B, C, D, z=None, delta_bias=None, delta_softplus=True):
+def selective_scan_paddle(x, dt, A, B, C, D, z=None, delta_bias=None, delta_softplus=True, return_last_state=False):
     batch, d_inner, seq_len = x.shape
     _, d_state, _ = B.shape
     orig_dtype = x.dtype
@@ -57,7 +59,7 @@ def selective_scan_paddle(x, dt, A, B, C, D, z=None, delta_bias=None, delta_soft
     outputs = []
 
     for i in range(seq_len):
-        state = state * dA[:, :, :, i] + x[:, :, i:i+1] * dB[:, :, :, i]
+        state = state * dA[:, :, :, i] + x[:, :, i:i + 1] * dB[:, :, :, i]
         y = paddle.einsum('bds,bs->bd', state, C[:, :, i])
         y = y + D * x[:, :, i]
         outputs.append(y)
@@ -67,7 +69,10 @@ def selective_scan_paddle(x, dt, A, B, C, D, z=None, delta_bias=None, delta_soft
     if z is not None:
         y = y * F.silu(z.astype('float32'))
 
-    return y.astype(orig_dtype)
+    y = y.astype(orig_dtype)
+    if return_last_state:
+        return y, state.astype(orig_dtype)
+    return y
 
 
 class Phi4RMSNorm(nn.Layer):
@@ -190,6 +195,7 @@ class Phi4MLP(nn.Layer):
         gate, y = paddle.chunk(y, 2, axis=-1)
         return self.fc2(y * F.silu(gate))
 
+
 class Phi4Attention(nn.Layer):
     def __init__(self, config: Phi4Config, layer_idx: Optional[int] = None, yoco_cross: bool = False):
         super().__init__()
@@ -225,16 +231,16 @@ class Phi4Attention(nn.Layer):
         self.inner_cross_attn = Phi4DiffAttention(self.head_dim, self.layer_idx)
 
     def forward(
-        self,
-        hidden_states,
-        attention_mask=None,
-        position_ids=None,
-        past_key_value=None,
-        output_attentions=False,
-        use_cache=False,
-        cache_position=None,
-        yoco_key_values=None,
-        **kwargs,
+            self,
+            hidden_states,
+            attention_mask=None,
+            position_ids=None,
+            past_key_value=None,
+            output_attentions=False,
+            use_cache=False,
+            cache_position=None,
+            yoco_key_values=None,
+            **kwargs,
     ):
         bsz, q_len, _ = hidden_states.shape
 
@@ -246,12 +252,14 @@ class Phi4Attention(nn.Layer):
             qkv = self.Wqkv(hidden_states)
             query_pos = self.num_heads * self.head_dim
             query_states = qkv[..., :query_pos]
-            key_states = qkv[..., query_pos : query_pos + self.num_key_value_heads * self.head_dim]
-            value_states = qkv[..., query_pos + self.num_key_value_heads * self.head_dim :]
+            key_states = qkv[..., query_pos: query_pos + self.num_key_value_heads * self.head_dim]
+            value_states = qkv[..., query_pos + self.num_key_value_heads * self.head_dim:]
 
             query_states = query_states.reshape([bsz, q_len, self.num_heads, self.head_dim]).transpose([0, 2, 1, 3])
-            key_states = key_states.reshape([bsz, q_len, self.num_key_value_heads, self.head_dim]).transpose([0, 2, 1, 3])
-            value_states = value_states.reshape([bsz, q_len, self.num_key_value_heads, self.head_dim]).transpose([0, 2, 1, 3])
+            key_states = key_states.reshape([bsz, q_len, self.num_key_value_heads, self.head_dim]).transpose(
+                [0, 2, 1, 3])
+            value_states = value_states.reshape([bsz, q_len, self.num_key_value_heads, self.head_dim]).transpose(
+                [0, 2, 1, 3])
 
             if past_key_value is not None:
                 cache_kwargs = {"cache_position": cache_position}
@@ -279,19 +287,19 @@ class Phi4Attention(nn.Layer):
 
 class Phi4Mamba(nn.Layer):
     def __init__(
-        self,
-        d_model,
-        d_state=16,
-        d_conv=4,
-        expand=2,
-        dt_rank="auto",
-        conv_bias=True,
-        bias=False,
-        use_fast_path=True,
-        layer_idx=None,
-        yoco_cross=False,
-        yoco_kv=False,
-        dtype=None,
+            self,
+            d_model,
+            d_state=16,
+            d_conv=4,
+            expand=2,
+            dt_rank="auto",
+            conv_bias=True,
+            bias=False,
+            use_fast_path=True,
+            layer_idx=None,
+            yoco_cross=False,
+            yoco_kv=False,
+            dtype=None,
     ):
         super().__init__()
         self.d_model = d_model
@@ -398,15 +406,20 @@ class Phi4Mamba(nn.Layer):
                 x, dt, A, B, C, self.D.astype('float32'),
                 z=None if self.yoco_kv else z,
                 delta_bias=self.dt_proj.bias.astype('float32') if self.dt_proj.bias is not None else None,
-                delta_softplus=True
+                delta_softplus=True,
+                return_last_state=ssm_state is not None,
             )
-            
+            # --- PyTorch: ssm_state.copy_(last_state) (ref: modeling_phi4flash.py) ---
+            if ssm_state is not None:
+                y, last_state = y
+                ssm_state.set_value(last_state.astype(ssm_state.dtype))
+
             y = y.transpose([0, 2, 1])
             if self.yoco_kv:
                 yoco_key_values = y
                 y = swiglu(z, y)
             out = self.out_proj(y)
-        
+
         return out, yoco_key_values
 
     def step(self, hidden_states, conv_state, ssm_state, yoco_key_values):
@@ -427,13 +440,14 @@ class Phi4Mamba(nn.Layer):
         x_db = self.x_proj(x)
         dt, B, C = paddle.split(x_db, [self.dt_rank, self.d_state, self.d_state], axis=-1)
         dt = paddle.matmul(dt, self.dt_proj.weight)
-        A = -paddle.exp(self.A_log).astype(dtype)
+        # --- PyTorch: A stays float32 for precision (ref: modeling_phi4flash.py step) ---
+        A = -paddle.exp(self.A_log.astype('float32'))
 
         dt = F.softplus(dt + self.dt_proj.bias.astype(dtype))
-        dA = paddle.exp(paddle.einsum('bd,dn->bdn', dt, A))
-        dB = paddle.einsum('bd,bn->bdn', dt.astype(dtype), B.astype(dtype))
-        ssm_state_new = ssm_state.astype(dtype) * dA + x.unsqueeze(2) * dB
-        ssm_state.set_value(ssm_state_new)
+        dA = paddle.exp(paddle.einsum('bd,dn->bdn', dt.astype('float32'), A))
+        dB = paddle.einsum('bd,bn->bdn', dt.astype('float32'), B.astype('float32'))
+        ssm_state_new = ssm_state.astype('float32') * dA + x.astype('float32').unsqueeze(2) * dB
+        ssm_state.set_value(ssm_state_new.astype(ssm_state.dtype))
 
         y = paddle.einsum('bdn,bn->bd', ssm_state.astype(dtype), C)
         y = y + self.D.astype(dtype) * x
@@ -455,13 +469,13 @@ class Phi4Mamba(nn.Layer):
 
 class Phi4Cache:
     def __init__(
-        self,
-        config: Phi4Config,
-        batch_size: int = None,
-        max_cache_len: int = None,
-        device: str = "gpu",
-        dtype=None,
-        max_batch_size: Optional[int] = None,
+            self,
+            config: Phi4Config,
+            batch_size: int = None,
+            max_cache_len: int = None,
+            device: str = "gpu",
+            dtype=None,
+            max_batch_size: Optional[int] = None,
     ):
         self.dtype = dtype if dtype is not None else paddle.get_default_dtype()
         self._max_cache_len = max_cache_len
@@ -473,18 +487,20 @@ class Phi4Cache:
         self.key_cache = []
         self.value_cache = []
         self.config = config
-        
+
         intermediate_size = config.mamba_expand * config.hidden_size
         ssm_state_size = config.mamba_d_state
         conv_kernel_size = config.mamba_d_conv
         self.conv_kernel_size = conv_kernel_size
-        
+
         for layer_idx in range(config.num_hidden_layers):
             use_mamba = config.mb_per_layer > 0 and layer_idx % config.mb_per_layer == 0
             if use_mamba:
                 if self._max_batch_size is not None:
-                    conv_state = paddle.zeros([self._max_batch_size, intermediate_size, conv_kernel_size], dtype=self.dtype)
-                    ssm_state = paddle.zeros([self._max_batch_size, intermediate_size, ssm_state_size], dtype=self.dtype)
+                    conv_state = paddle.zeros([self._max_batch_size, intermediate_size, conv_kernel_size],
+                                              dtype=self.dtype)
+                    ssm_state = paddle.zeros([self._max_batch_size, intermediate_size, ssm_state_size],
+                                             dtype=self.dtype)
                 else:
                     conv_state = None
                     ssm_state = None
@@ -501,41 +517,41 @@ class Phi4Cache:
     def update(self, key_states, value_states, layer_idx: int, cache_kwargs: Optional[Dict[str, Any]] = None):
         if layer_idx >= len(self.key_cache):
             raise ValueError(f"Layer index {layer_idx} out of range for cache with {len(self.key_cache)} layers")
-        
+
         use_mamba = self.config.mb_per_layer > 0 and layer_idx % self.config.mb_per_layer == 0
         if use_mamba:
             return key_states, value_states
-        
+
         sliding_window = None
-        if (self.config.sliding_window is not None and 
-            layer_idx < len(self.config.sliding_window) and
-            self.config.sliding_window[layer_idx] is not None and
-            layer_idx != self.global_attn_idx):
+        if (self.config.sliding_window is not None and
+                layer_idx < len(self.config.sliding_window) and
+                self.config.sliding_window[layer_idx] is not None and
+                layer_idx != self.global_attn_idx):
             sliding_window = self.config.sliding_window[layer_idx]
-        
+
         if self.key_cache[layer_idx] is None:
             self.key_cache[layer_idx] = key_states
             self.value_cache[layer_idx] = value_states
         else:
             self.key_cache[layer_idx] = paddle.concat([self.key_cache[layer_idx], key_states], axis=2)
             self.value_cache[layer_idx] = paddle.concat([self.value_cache[layer_idx], value_states], axis=2)
-            
+
             if sliding_window is not None and self.key_cache[layer_idx].shape[2] > sliding_window:
                 self.key_cache[layer_idx] = self.key_cache[layer_idx][:, :, -sliding_window:, :]
                 self.value_cache[layer_idx] = self.value_cache[layer_idx][:, :, -sliding_window:, :]
-        
+
         return self.key_cache[layer_idx], self.value_cache[layer_idx]
 
     def get_seq_length(self, layer_idx: Optional[int] = None):
         if layer_idx is None:
             layer_idx = self.global_attn_idx
-        
+
         if layer_idx >= len(self.key_cache):
             return 0
-        
+
         if self.key_cache[layer_idx] is None:
             return 0
-        
+
         return self.key_cache[layer_idx].shape[2]
 
     def get_max_cache_shape(self) -> Optional[int]:
@@ -598,21 +614,23 @@ class Phi4DecoderLayer(nn.Layer):
         self.post_attention_layernorm = PHI_NORM_CLASS(config.hidden_size, epsilon=config.layer_norm_eps)
 
     def forward(
-        self,
-        hidden_states,
-        attention_mask=None,
-        position_ids=None,
-        past_key_value=None,
-        output_attentions=False,
-        use_cache=False,
-        cache_position=None,
-        ssm_output=None,
-        yoco_key_values=None,
-        **kwargs,
+            self,
+            hidden_states,
+            attention_mask=None,
+            position_ids=None,
+            past_key_value=None,
+            output_attentions=False,
+            use_cache=False,
+            cache_position=None,
+            ssm_output=None,
+            yoco_key_values=None,
+            causal_mask=None,
+            **kwargs,
     ):
         residual = hidden_states
         hidden_dtype = hidden_states.dtype
-        hidden_states = self.input_layernorm(hidden_states.astype(self.input_layernorm.weight.dtype)).astype(hidden_dtype)
+        hidden_states = self.input_layernorm(hidden_states.astype(self.input_layernorm.weight.dtype)).astype(
+            hidden_dtype)
 
         if self.use_mamba:
             attn_outputs, ssm_output = self.attn(
@@ -622,19 +640,23 @@ class Phi4DecoderLayer(nn.Layer):
                 yoco_key_values=ssm_output,
                 cache_position=cache_position,
             )
+            # --- PyTorch: residual.to(torch.float32) for Mamba (ref: modeling_phi4flash.py) ---
+            residual = residual.astype('float32')
             self_attn_weights = None
         else:
+            # --- PyTorch: sliding_window truncation (ref: modeling_phi4flash.py SambaYDecoderLayer.forward) ---
+            layer_mask = causal_mask
             if (
-                self.config.sliding_window is not None
-                and self.config.sliding_window[self.layer_idx] is not None
-                and attention_mask is not None
+                    self.config.sliding_window is not None
+                    and self.config.sliding_window[self.layer_idx] is not None
+                    and layer_mask is not None
             ):
                 if past_key_value is not None and cache_position[0] > 0:
-                    attention_mask = attention_mask[:, -self.config.sliding_window[self.layer_idx] :]
+                    layer_mask = layer_mask[:, :, :, -self.config.sliding_window[self.layer_idx]:]
 
             attn_outputs, self_attn_weights, yoco_key_values = self.attn(
                 hidden_states=hidden_states,
-                attention_mask=attention_mask,
+                attention_mask=layer_mask,
                 position_ids=position_ids,
                 past_key_value=past_key_value,
                 output_attentions=output_attentions,
@@ -643,11 +665,12 @@ class Phi4DecoderLayer(nn.Layer):
                 yoco_key_values=yoco_key_values,
             )
 
-        hidden_states = residual + self.resid_attn_dropout(attn_outputs)
+        # --- PyTorch: residual connection in float32 for Mamba, then cast back ---
+        hidden_states = (residual + self.resid_attn_dropout(attn_outputs)).astype(hidden_dtype)
 
         residual = hidden_states
-        hidden_dtype = hidden_states.dtype
-        hidden_states = self.post_attention_layernorm(hidden_states.astype(self.post_attention_layernorm.weight.dtype)).astype(hidden_dtype)
+        hidden_states = self.post_attention_layernorm(
+            hidden_states.astype(self.post_attention_layernorm.weight.dtype)).astype(hidden_dtype)
         hidden_states = self.mlp(hidden_states)
         hidden_states = residual + self.resid_mlp_dropout(hidden_states)
 
@@ -767,18 +790,46 @@ class Phi4Model(Phi4PretrainedModel):
     def set_input_embeddings(self, value):
         self.embed_tokens = value
 
+    @staticmethod
+    def _build_causal_mask(attention_mask, input_shape, past_key_values_length, dtype, sliding_window_size=None):
+        # --- PyTorch: FA uses causal=True internally; here we build explicit 4D causal mask ---
+        if input_shape[-1] <= 1 and past_key_values_length > 0:
+            return None
+        if attention_mask is not None and attention_mask.ndim == 2:
+            expanded_attn_mask = _expand_2d_mask(attention_mask, dtype, tgt_length=input_shape[-1])
+            causal = _make_causal_mask(input_shape, past_key_values_length=past_key_values_length)
+            if sliding_window_size is not None:
+                window_mask = _make_sliding_window_mask(
+                    input_shape, past_key_values_length=past_key_values_length, window_size=sliding_window_size
+                )
+                combined = causal & window_mask
+            else:
+                combined = causal
+            expanded_attn_mask = expanded_attn_mask & combined
+            return paddle.where(expanded_attn_mask.cast("bool"), 0.0, paddle.finfo(dtype).min).astype(dtype)
+        elif attention_mask is not None and attention_mask.ndim >= 3:
+            return attention_mask
+        else:
+            causal = _make_causal_mask(input_shape, past_key_values_length=past_key_values_length)
+            if sliding_window_size is not None:
+                window_mask = _make_sliding_window_mask(
+                    input_shape, past_key_values_length=past_key_values_length, window_size=sliding_window_size
+                )
+                causal = causal & window_mask
+            return paddle.where(causal.cast("bool"), 0.0, paddle.finfo(dtype).min).astype(dtype)
+
     def forward(
-        self,
-        input_ids=None,
-        attention_mask=None,
-        position_ids=None,
-        past_key_values=None,
-        inputs_embeds=None,
-        use_cache=None,
-        output_attentions=None,
-        output_hidden_states=None,
-        return_dict=None,
-        cache_position=None,
+            self,
+            input_ids=None,
+            attention_mask=None,
+            position_ids=None,
+            past_key_values=None,
+            inputs_embeds=None,
+            use_cache=None,
+            output_attentions=None,
+            output_hidden_states=None,
+            return_dict=None,
+            cache_position=None,
     ):
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
@@ -819,7 +870,7 @@ class Phi4Model(Phi4PretrainedModel):
             if past_key_values is not None and hasattr(past_key_values, 'get_seq_length'):
                 past_seen_tokens = past_key_values.get_seq_length()
             cache_position = paddle.arange(
-                past_seen_tokens, 
+                past_seen_tokens,
                 past_seen_tokens + inputs_embeds.shape[1],
                 dtype=paddle.int64
             )
@@ -836,6 +887,27 @@ class Phi4Model(Phi4PretrainedModel):
 
         hidden_states = inputs_embeds
 
+        # --- PyTorch: causal=True (ref: modeling_phi4flash.py FlashDiffCustomAttention) ---
+        past_key_values_length = 0
+        if past_key_values is not None and hasattr(past_key_values, 'get_seq_length'):
+            past_key_values_length = past_key_values.get_seq_length()
+        input_shape = (batch_size, seq_length)
+        causal_mask = self._build_causal_mask(
+            attention_mask, input_shape, past_key_values_length, inputs_embeds.dtype
+        )
+        # --- PyTorch: sliding_window via FA window_size param (ref: modeling_phi4flash.py) ---
+        sliding_window_sizes = []
+        if self.config.sliding_window:
+            for sw in self.config.sliding_window:
+                if sw is not None and sw not in sliding_window_sizes:
+                    sliding_window_sizes.append(sw)
+        sliding_causal_masks = {}
+        for sw in sliding_window_sizes:
+            sliding_causal_masks[sw] = self._build_causal_mask(
+                attention_mask, input_shape, past_key_values_length, inputs_embeds.dtype,
+                sliding_window_size=sw
+            )
+
         all_hidden_states = () if output_hidden_states else None
         all_self_attns = () if output_attentions else None
         ssm_output = None
@@ -844,6 +916,12 @@ class Phi4Model(Phi4PretrainedModel):
         for decoder_layer in self.layers:
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
+
+            layer_idx = decoder_layer.layer_idx
+            sw = (self.config.sliding_window[layer_idx]
+                  if self.config.sliding_window is not None and layer_idx < len(self.config.sliding_window)
+                  else None)
+            layer_causal_mask = sliding_causal_masks.get(sw, causal_mask) if sw is not None else causal_mask
 
             if self.gradient_checkpointing and self.training:
                 layer_outputs = recompute(
@@ -857,6 +935,7 @@ class Phi4Model(Phi4PretrainedModel):
                     cache_position,
                     ssm_output,
                     yoco_key_values,
+                    layer_causal_mask,
                 )
             else:
                 layer_outputs = decoder_layer(
@@ -869,6 +948,7 @@ class Phi4Model(Phi4PretrainedModel):
                     cache_position=cache_position,
                     ssm_output=ssm_output,
                     yoco_key_values=yoco_key_values,
+                    causal_mask=layer_causal_mask,
                 )
 
             hidden_states = layer_outputs[0]
@@ -879,13 +959,15 @@ class Phi4Model(Phi4PretrainedModel):
                 all_self_attns += (layer_outputs[3],)
 
         hidden_dtype = hidden_states.dtype
-        hidden_states = self.final_layernorm(hidden_states.astype(self.final_layernorm.weight.dtype)).astype(hidden_dtype)
+        hidden_states = self.final_layernorm(hidden_states.astype(self.final_layernorm.weight.dtype)).astype(
+            hidden_dtype)
 
         if output_hidden_states:
             all_hidden_states += (hidden_states,)
 
         if not return_dict:
-            return tuple(v for v in [hidden_states, past_key_values, all_hidden_states, all_self_attns] if v is not None)
+            return tuple(
+                v for v in [hidden_states, past_key_values, all_hidden_states, all_self_attns] if v is not None)
 
         return BaseModelOutputWithPast(
             last_hidden_state=hidden_states,
@@ -922,20 +1004,20 @@ class Phi4ForCausalLM(Phi4PretrainedModel):
         return self.model
 
     def forward(
-        self,
-        input_ids=None,
-        attention_mask=None,
-        position_ids=None,
-        past_key_values=None,
-        inputs_embeds=None,
-        labels=None,
-        loss_mask=None,
-        use_cache=None,
-        output_attentions=None,
-        output_hidden_states=None,
-        return_dict=None,
-        cache_position=None,
-        **kwargs,
+            self,
+            input_ids=None,
+            attention_mask=None,
+            position_ids=None,
+            past_key_values=None,
+            inputs_embeds=None,
+            labels=None,
+            loss_mask=None,
+            use_cache=None,
+            output_attentions=None,
+            output_hidden_states=None,
+            return_dict=None,
+            cache_position=None,
+            **kwargs,
     ):
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
@@ -976,13 +1058,13 @@ class Phi4ForCausalLM(Phi4PretrainedModel):
         )
 
     def prepare_inputs_for_generation(
-        self,
-        input_ids,
-        past_key_values=None,
-        attention_mask=None,
-        inputs_embeds=None,
-        cache_position=None,
-        **kwargs,
+            self,
+            input_ids,
+            past_key_values=None,
+            attention_mask=None,
+            inputs_embeds=None,
+            cache_position=None,
+            **kwargs,
     ):
         if past_key_values is not None:
             input_ids = input_ids[:, -1:]

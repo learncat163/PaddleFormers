@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import math
+
 from ..configuration_utils import PretrainedConfig
 
 
@@ -20,37 +21,37 @@ class Phi4Config(PretrainedConfig):
     model_type = "phi4"
 
     def __init__(
-        self,
-        vocab_size=200064,
-        hidden_size=2560,
-        intermediate_size=10240,
-        num_hidden_layers=32,
-        num_attention_heads=40,
-        num_key_value_heads=20,
-        resid_pdrop=0.0,
-        embd_pdrop=0.0,
-        attention_dropout=0.0,
-        hidden_act="silu",
-        max_position_embeddings=4096,
-        initializer_range=0.02,
-        layer_norm_eps=1e-5,
-        use_cache=True,
-        tie_word_embeddings=True,
-        rope_theta=10000.0,
-        bos_token_id=199999,
-        eos_token_id=199999,
-        pad_token_id=199999,
-        sliding_window=512,
-        mb_per_layer=2,
-        mamba_d_state=16,
-        mamba_d_conv=4,
-        mamba_expand=2,
-        mamba_dt_rank="auto",
-        mamba_conv_bias=True,
-        mamba_proj_bias=False,
-        mlp_bias=False,
-        lm_head_bias=False,
-        **kwargs,
+            self,
+            vocab_size=200064,
+            hidden_size=2560,
+            intermediate_size=10240,
+            num_hidden_layers=32,
+            num_attention_heads=40,
+            num_key_value_heads=20,
+            resid_pdrop=0.0,
+            embd_pdrop=0.0,
+            attention_dropout=0.0,
+            hidden_act="silu",
+            max_position_embeddings=4096,
+            initializer_range=0.02,
+            layer_norm_eps=1e-5,
+            use_cache=True,
+            tie_word_embeddings=True,
+            rope_theta=10000.0,
+            bos_token_id=199999,
+            eos_token_id=199999,
+            pad_token_id=199999,
+            sliding_window=512,
+            mb_per_layer=2,
+            mamba_d_state=16,
+            mamba_d_conv=4,
+            mamba_expand=2,
+            mamba_dt_rank="auto",
+            mamba_conv_bias=True,
+            mamba_proj_bias=False,
+            mlp_bias=False,
+            lm_head_bias=False,
+            **kwargs,
     ):
         self.vocab_size = vocab_size
         self.hidden_size = hidden_size
@@ -75,10 +76,13 @@ class Phi4Config(PretrainedConfig):
         self.pad_token_id = pad_token_id
         self.mlp_bias = mlp_bias
         self.lm_head_bias = lm_head_bias
-        self.sliding_window = [
-            sliding_window if layer_idx < num_hidden_layers // 2 and layer_idx % 2 == 1 else None
-            for layer_idx in range(num_hidden_layers)
-        ]
+        if isinstance(sliding_window, list):
+            self.sliding_window = sliding_window
+        else:
+            self.sliding_window = [
+                sliding_window if layer_idx < num_hidden_layers // 2 and layer_idx % 2 == 1 else None
+                for layer_idx in range(num_hidden_layers)
+            ]
 
         self.mamba_d_state = mamba_d_state
         self.mamba_d_conv = mamba_d_conv
