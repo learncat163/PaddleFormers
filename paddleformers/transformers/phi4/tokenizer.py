@@ -142,3 +142,43 @@ class Phi4Tokenizer(PreTrainedTokenizerFast):
             return bos + ([0] * len(token_ids_0)) + eos
         return bos + ([0] * len(token_ids_0)) + eos + bos + ([0] * len(token_ids_1)) + eos
 
+    # 全参微调的时候，会调用到;
+    # 不要觉得没人调用，就删掉，因为 原版的transformers没有集成 phi4 的实现；
+    # 如果强行 使用 warp_tokenizer 会很多棘手问题处理，这里 直接借鉴了hg上原版的 phi4 的逻辑
+    def encode(
+        self,
+        text=None,
+        text_pair=None,
+        add_special_tokens: bool = True,
+        padding=False,
+        truncation=None,
+        max_length: Optional[int] = None,
+        stride: int = 0,
+        padding_side: Optional[str] = None,
+        return_tensors: Optional[str] = None,
+        **kwargs,
+    ) -> List[int]:
+        padding_strategy, truncation_strategy, max_length, kwargs_updated = self._get_padding_truncation_strategies(
+            padding=padding,
+            truncation=truncation,
+            max_length=max_length,
+            **kwargs,
+        )
+
+        kwargs.update(kwargs_updated)
+
+        encoded_inputs = self._encode_plus(
+            text,
+            text_pair=text_pair,
+            add_special_tokens=add_special_tokens,
+            padding_strategy=padding_strategy,
+            truncation_strategy=truncation_strategy,
+            max_length=max_length,
+            stride=stride,
+            padding_side=padding_side,
+            return_tensors=return_tensors,
+            **kwargs,
+        )
+
+        return encoded_inputs["input_ids"]
+

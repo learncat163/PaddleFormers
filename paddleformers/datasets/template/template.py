@@ -903,15 +903,28 @@ register_template(
 )
 
 
+# phi4 chat template from phi4-code-raw/tokenizer_config.json:
+# {{ '<|' + message['role'] + '|>' + message['content'] + '<|end|>' }}
+# Special tokens: <|user|>(200022), <|system|>(200023), <|assistant|>(200019), <|end|>(200020)
 register_template(
     name="phi4",
-    format_user=StringFormatter(
-        slots=["<|im_start|>user<|im_sep|>{{content}}<|im_end|><|im_start|>assistant<|im_sep|>"]
-    ),
+    format_user=StringFormatter(slots=["<|user|>{{content}}<|end|><|assistant|>"]),
     format_assistant=StringFormatter(slots=["{{content}}"]),
-    format_system=StringFormatter(slots=["<|im_start|>system<|im_sep|>{{content}}<|im_end|>"]),
-    suffix=["<|im_end|>"],
-    chat_sep="<|im_end|>",
+    format_system=StringFormatter(slots=["<|system|>{{content}}<|end|>"]),
+    chat_sep="<|end|>",
+    suffix=["<|end|>"],
+    template_class=ReasoningTemplate,
+)
+
+# phi4 without thinking, for non-reasoning SFT tasks
+register_template(
+    name="phi4_nothink",
+    format_user=StringFormatter(slots=["<|user|>{{content}}<|end|><|assistant|>"]),
+    format_assistant=StringFormatter(slots=["{{content}}"]),
+    format_system=StringFormatter(slots=["<|system|>{{content}}<|end|>"]),
+    chat_sep="<|end|>",
+    suffix=["<|end|>"],
+    enable_thinking=None,
 )
 register_template(
     name="glm_ocr",

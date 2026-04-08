@@ -252,26 +252,6 @@ class TestPhi4Modeling(unittest.TestCase):
         self.assertGreaterEqual(match_count, len(ref_new_token_ids) * 0.8,
                                 f"Token id match too low: {match_count}/{len(ref_new_token_ids)}")
 
-
-class TestPhi4BF16Optimization(unittest.TestCase):
-    """Phi4 bf16优化测试"""
-    
-    def setUp(self):
-        """测试前的设置"""
-        self.model_path = "/mnt/caoyuanye/llm/microsoft/Phi-4-mini-flash-reasoning-paddle"
-    
-    def test_bf16_memory_usage(self):
-        """测试bf16显存使用
-        
-        注意：由于AOA引擎（paddlefleet）不支持paddle.bfloat16 dtype，
-        此测试暂时跳过。当AOA引擎修复后，可以重新启用此测试。
-        TODO: 跟踪AOA引擎bf16支持问题
-        """
-        self.skipTest("BF16 memory usage test skipped: AOA engine does not support paddle.bfloat16 dtype")
-    
-    def test_bf16_forward_speed(self):
-        self.skipTest("BF16 forward speed test skipped: AOA engine does not support paddle.bfloat16 dtype")
-
 class TestPhi4InferenceUseHf(unittest.TestCase):
     model_path = "/mnt/caoyuanye/llm/microsoft/Phi-4-mini-flash-reasoning"
     model = None
