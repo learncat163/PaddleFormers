@@ -102,6 +102,7 @@ class OpenELMPreTrainedModel(PretrainedModel):
     base_model_prefix = "transformer"
     _no_split_modules = ["OpenELMDecoderLayer"]
     _skip_keys_device_placement = "past_key_values"
+    transpose_weight_keys = ["qkv_proj", "out_proj", "proj_1", "proj_2"]
 
     def __init__(self, *inputs, **kwargs) -> None:
         super().__init__(*inputs, **kwargs)
