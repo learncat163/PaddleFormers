@@ -343,52 +343,6 @@ class Llama2Template(Template):
 
 
 @dataclass
-class OpenELMTemplate(Template):
-    r"""OpenELM chat template implementation."""
-
-    @override
-    def _encode(
-        self,
-        tokenizer: "PreTrainedTokenizer",
-        messages: list[dict[str, str]],
-        system: str,
-        tools: str,
-    ) -> list[list[int]]:
-        system = system or self.default_system
-        encoded_messages = []
-        for i, message in enumerate(messages):
-            elements = []
-
-            system_text = ""
-            if i == 0:
-                elements += self.format_prefix.apply()
-                if system or tools:
-                    tool_text = self.format_tools.apply(content=tools)[0] if tools else ""
-                    system_text = self.format_system.apply(content=(system + tool_text))[0]
-
-            if message["role"] == Role.USER:
-                elements += self.format_user.apply(content=system_text + message["content"])
-            elif message["role"] == Role.ASSISTANT:
-                elements += self.format_assistant.apply(content=message["content"])
-                if "tool_calls" in message:
-                    elements += self.format_function.apply(content=message["tool_calls"])
-                if i < len(messages) - 1:
-                    elements += [self.chat_sep]
-            elif message["role"] == Role.OBSERVATION:
-                elements += self.format_observation.apply(content=message["content"])
-            elif message["role"] == Role.FUNCTION:
-                elements += self.format_function.apply(content=message["content"])
-                if i < len(messages) - 1:
-                    elements += [self.chat_sep]
-            else:
-                raise NotImplementedError("Unexpected role: {}".format(message["role"]))
-
-            encoded_messages.append(self._convert_elements_to_ids(tokenizer, elements))
-
-        return encoded_messages
-
-
-@dataclass
 class ErnieThinkingTemplate(ReasoningTemplate):
     r"""A template that fuse the system message to first user message."""
 
@@ -988,7 +942,6 @@ register_template(
     format_prefix=EmptyFormatter(slots=[{"bos_token"}]),
     suffix=["</s>"],
     efficient_eos=True,
-    template_class=OpenELMTemplate,
 )
 
 register_template(

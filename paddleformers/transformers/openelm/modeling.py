@@ -989,20 +989,11 @@ class OpenELMForCausalLM(OpenELMPreTrainedModel):
         logits = logits[:, : self.config.vocab_size]
         loss = None
         if labels is not None:
-            # Shift so that tokens < n predict n
-            # 原始代码: shift_logits = logits[..., :-1, :].contiguous()
-            shift_logits = logits[..., :-1, :]
-            # 原始代码: shift_labels = labels[..., 1:].contiguous()
-            shift_labels = labels[..., 1:]
-            # Flatten the tokens
-            # 原始代码: loss_fct = CrossEntropyLoss()
+            # PaddleFormers SFTDataset 已经做过 label shift（labels = labels[1:] + [-100]），
+            # 这里不能再次 shift，否则会造成训练目标错位。
             loss_fct = nn.CrossEntropyLoss()
-            # 原始代码: shift_logits = shift_logits.view(-1, self.config.vocab_size)
-            shift_logits = shift_logits.reshape([-1, self.config.vocab_size])
-            # 原始代码: shift_labels = shift_labels.view(-1)
-            shift_labels = shift_labels.reshape([-1])
-            # Enable model parallelism
-            # 原始代码: shift_labels = shift_labels.to(shift_logits.device)
+            shift_logits = logits.reshape([-1, self.config.vocab_size])
+            shift_labels = labels.reshape([-1])
             # 注意: labels 应保持 int64 类型，不需要 cast 到 logits 的 dtype
             loss = loss_fct(shift_logits, shift_labels)
 
