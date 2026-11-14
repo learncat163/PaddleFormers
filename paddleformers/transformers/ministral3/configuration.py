@@ -75,8 +75,9 @@ class Mistral3Config(PretrainedConfig):
             Whether to use bias in the multimodal projector.
         spatial_merge_size (`int`, *optional*, defaults to 2):
             The downsampling factor for the spatial merge operation.
-        tie_word_embeddings (`bool`, *optional*, defaults to `False`):
-            Whether to tie the input and output embeddings.
+        tie_word_embeddings (`bool`, *optional*):
+            Whether to tie the input and output embeddings. If unset, uses the value from `text_config`,
+            falling back to `False` when absent.
     """
 
     model_type = "mistral3"
@@ -92,7 +93,7 @@ class Mistral3Config(PretrainedConfig):
         vision_feature_layer=-1,
         multimodal_projector_bias=False,
         spatial_merge_size=2,
-        tie_word_embeddings: bool = False,
+        tie_word_embeddings=None,
         initializer_range=0.02,
         **kwargs,
     ):
@@ -136,15 +137,19 @@ class Mistral3Config(PretrainedConfig):
                 "use_cache": True,
                 "vocab_size": 131072,
             }
+        if tie_word_embeddings is None:
+            tie_word_embeddings = (
+                text_config.get("tie_word_embeddings", False)
+                if isinstance(text_config, dict)
+                else getattr(text_config, "tie_word_embeddings", False)
+            )
         if isinstance(text_config, dict):
             text_config = Mistral3TextConfig(**text_config)
         self.text_config = text_config
 
         self.multimodal_projector_bias = multimodal_projector_bias
         self.spatial_merge_size = spatial_merge_size
-        self.tie_word_embeddings = tie_word_embeddings
-
-        super().__init__(**kwargs)
+        super().__init__(tie_word_embeddings=tie_word_embeddings, **kwargs)
 
 
 class Mistral3VisionConfig(PretrainedConfig):

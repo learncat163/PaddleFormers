@@ -20,6 +20,7 @@ import paddle.nn as nn
 import paddle.nn.functional as F
 from paddle import Tensor
 
+from ...utils.masking_utils import _gen_from_sparse_attn_mask_indices
 from ..activations import ACT2FN
 from ..cache_utils import Cache, DynamicCache
 from ..model_outputs import BaseModelOutputWithPast, ModelOutput
@@ -189,9 +190,12 @@ class Ministral3Attention(nn.Layer):
 
         attn_weights = paddle.matmul(query, key.transpose([0, 1, 3, 2])) * self.scaling
         if attn_mask_startend_row_indices is not None:
-            attn_weights = attn_weights + attn_mask_startend_row_indices.cast(query.dtype)
-        elif attention_mask is not None:
-            attn_weights = attn_weights + attention_mask
+            attention_mask = _gen_from_sparse_attn_mask_indices(
+                attn_mask_startend_row_indices, query.dtype, is_causal=True
+            )
+            attention_mask = paddle.index_select(attention_mask, cache_position, axis=2)
+        if attention_mask is not None:
+            attn_weights = attn_weights + attention_mask[:, :, :, : key.shape[-2]]
 
         attn_weights = F.softmax(attn_weights, axis=-1, dtype="float32").cast(query.dtype)
         if self.training and self.attention_dropout > 0:

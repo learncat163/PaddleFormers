@@ -14,6 +14,7 @@
 
 
 import os
+import tempfile
 import unittest
 
 import numpy as np
@@ -476,7 +477,235 @@ class TestMinistral3OutputFlags(unittest.TestCase):
 
 
 class TestMistral3ConditionalGenerationOutputs(unittest.TestCase):
-    """End-to-end output flags through Mistral3ForConditionalGeneration."""
+    """End-to-end outputs and checkpoints through Mistral3ForConditionalGeneration."""
+
+    def test_word_embedding_tying(self):
+        from paddleformers.transformers import (
+            Mistral3Config,
+            Mistral3ForConditionalGeneration,
+            Mistral3TextConfig,
+        )
+
+        cases = [
+            ({"tie_word_embeddings": False}, False, False),
+            ({"tie_word_embeddings": False}, True, False),
+            ({"tie_word_embeddings": True}, False, True),
+            ({}, True, True),
+            ({}, False, False),
+            ({}, None, False),
+            ({"tie_word_embeddings": None}, True, True),
+            ({"tie_word_embeddings": None}, None, False),
+        ]
+        self.assertFalse(Mistral3Config().tie_word_embeddings)
+        for top_config, text_tie, expected in cases:
+            for as_dict in (True, False):
+                with self.subTest(top_config=top_config, text_tie=text_tie, as_dict=as_dict):
+                    text_config = dict(SMALL_TEXT_CFG)
+                    if text_tie is not None:
+                        text_config["tie_word_embeddings"] = text_tie
+                    if not as_dict:
+                        text_config = Mistral3TextConfig(**text_config)
+                    config = Mistral3Config(text_config=text_config, vision_config=SMALL_VISION_CFG, **top_config)
+                    # A config object already carries its base class's default.
+                    effective_tie = expected
+                    if not as_dict and text_tie is None and top_config.get("tie_word_embeddings") is None:
+                        effective_tie = True
+                    self.assertEqual(config.tie_word_embeddings, effective_tie)
+                    model = Mistral3ForConditionalGeneration(config)
+                    embedding = model.get_input_embeddings().weight
+                    lm_head = model.lm_head.weight
+                    if effective_tie:
+                        self.assertIs(lm_head, embedding)
+                    else:
+                        self.assertIsNot(lm_head, embedding)
+
+                    input_ids = paddle.to_tensor([[1, 2, 3, 4]], dtype="int64")
+                    outputs = model(input_ids=input_ids, labels=input_ids, use_cache=False)
+                    self.assertTrue(paddle.isfinite(outputs.logits).all().item())
+                    outputs.loss.backward()
+                    for weight in (embedding, lm_head):
+                        self.assertIsNotNone(weight.grad)
+                        self.assertTrue(paddle.isfinite(weight.grad).all().item())
+
+    def test_word_embedding_tying_checkpoint_round_trip(self):
+        from paddleformers.transformers import (
+            Mistral3Config,
+            Mistral3ForConditionalGeneration,
+        )
+
+        for tie in (False, True):
+            with self.subTest(tie_word_embeddings=tie):
+                config = Mistral3Config(
+                    text_config=dict(SMALL_TEXT_CFG, tie_word_embeddings=not tie),
+                    vision_config=SMALL_VISION_CFG,
+                    tie_word_embeddings=tie,
+                )
+                model = Mistral3ForConditionalGeneration(config)
+                model.eval()
+                if not tie:
+                    model.lm_head.weight.set_value(model.get_input_embeddings().weight + 0.5)
+                input_ids = paddle.to_tensor([[1, 2, 3, 4]], dtype="int64")
+                with paddle.no_grad():
+                    expected_logits = model(input_ids=input_ids, use_cache=False).logits
+
+                with tempfile.TemporaryDirectory() as tmpdir:
+                    model.save_pretrained(tmpdir, save_checkpoint_format="legacy", save_safetensors=False)
+                    loaded = Mistral3ForConditionalGeneration.from_pretrained(tmpdir, dtype="float32")
+                loaded.eval()
+                self.assertEqual(loaded.config.tie_word_embeddings, tie)
+                if tie:
+                    self.assertIs(loaded.lm_head.weight, loaded.get_input_embeddings().weight)
+                else:
+                    self.assertIsNot(loaded.lm_head.weight, loaded.get_input_embeddings().weight)
+                for key in ("lm_head.weight", "model.language_model.embed_tokens.weight"):
+                    np.testing.assert_array_equal(loaded.state_dict()[key].numpy(), model.state_dict()[key].numpy())
+                with paddle.no_grad():
+                    actual_logits = loaded(input_ids=input_ids, use_cache=False).logits
+                np.testing.assert_allclose(actual_logits.numpy(), expected_logits.numpy(), atol=1e-5, rtol=1e-5)
+
+    def test_sparse_causal_mask_matches_dense(self):
+        from paddleformers.transformers import (
+            Mistral3Config,
+            Mistral3ForConditionalGeneration,
+        )
+
+        input_ids = paddle.to_tensor([[1, 2, 3, 4, 5, 6], [7, 8, 9, 10, 0, 0]], dtype="int64")
+        attention_mask = paddle.to_tensor([[1, 1, 1, 1, 1, 1], [1, 1, 1, 1, 0, 0]], dtype="int64")
+        labels = paddle.where(attention_mask.astype("bool"), input_ids, paddle.full_like(input_ids, -100))
+        row_indices = paddle.to_tensor([[[6, 6, 6, 6, 6, 6]], [[6, 6, 6, 6, 0, 0]]], dtype="int32")
+        for dtype in ("float32", "bfloat16"):
+            model = Mistral3ForConditionalGeneration(
+                Mistral3Config(text_config=SMALL_GQA_CFG, vision_config=SMALL_VISION_CFG)
+            )
+            model.to(dtype=dtype)
+            model.train()
+            with paddle.amp.auto_cast(enable=dtype == "bfloat16", dtype="bfloat16"):
+                dense = model(input_ids=input_ids, labels=labels, attention_mask=attention_mask, use_cache=False)
+            dense.loss.backward()
+            dense_grads = {
+                name: param.grad.astype("float32").numpy().copy()
+                for name, param in model.named_parameters()
+                if param.grad is not None
+            }
+            self.assertTrue(dense_grads)
+            for indices in (row_indices, row_indices.unsqueeze(-1)):
+                with self.subTest(dtype=dtype, mask_ndim=indices.ndim):
+                    model.clear_gradients()
+                    with paddle.amp.auto_cast(enable=dtype == "bfloat16", dtype="bfloat16"):
+                        sparse = model(
+                            input_ids=input_ids,
+                            labels=labels,
+                            attn_mask_startend_row_indices=indices,
+                            output_attentions=True,
+                            use_cache=False,
+                        )
+                    np.testing.assert_allclose(
+                        sparse.logits.astype("float32").numpy(),
+                        dense.logits.astype("float32").numpy(),
+                        atol=1e-5,
+                        rtol=1e-5,
+                    )
+                    np.testing.assert_allclose(
+                        sparse.loss.astype("float32").numpy(),
+                        dense.loss.astype("float32").numpy(),
+                        atol=1e-5,
+                        rtol=1e-5,
+                    )
+                    for weights in sparse.attentions:
+                        self.assertEqual(paddle.triu(weights, diagonal=1).abs().max().item(), 0.0)
+                        self.assertEqual(weights[1, :, :, 4:].abs().max().item(), 0.0)
+                    sparse.loss.backward()
+                    for name, param in model.named_parameters():
+                        if name in dense_grads:
+                            self.assertIsNotNone(param.grad)
+                            self.assertTrue(paddle.isfinite(param.grad).all().item())
+                            np.testing.assert_allclose(
+                                param.grad.astype("float32").numpy(), dense_grads[name], atol=1e-5, rtol=1e-5
+                            )
+
+    def test_sparse_packed_mask_isolates_sequences(self):
+        from paddleformers.transformers import (
+            Mistral3Config,
+            Mistral3ForConditionalGeneration,
+        )
+
+        model = Mistral3ForConditionalGeneration(
+            Mistral3Config(text_config=SMALL_GQA_CFG, vision_config=SMALL_VISION_CFG)
+        )
+        model.eval()
+        input_ids = paddle.to_tensor([[1, 2, 3, 4, 5, 6]], dtype="int64")
+        position_ids = paddle.to_tensor([[0, 1, 2, 0, 1, 2]], dtype="int64")
+        row_indices = paddle.to_tensor([[[[3], [3], [3], [6], [6], [6]]]], dtype="int32")
+        with paddle.no_grad():
+            packed = model(
+                input_ids=input_ids,
+                position_ids=position_ids,
+                attn_mask_startend_row_indices=row_indices,
+                output_attentions=True,
+                use_cache=False,
+            )
+            first = model(input_ids=input_ids[:, :3], use_cache=False).logits
+            second = model(input_ids=input_ids[:, 3:], use_cache=False).logits
+            np.testing.assert_allclose(
+                packed.logits.numpy(), paddle.concat([first, second], axis=1).numpy(), atol=1e-5, rtol=1e-5
+            )
+            for weights in packed.attentions:
+                self.assertEqual(paddle.triu(weights, diagonal=1).abs().max().item(), 0.0)
+                self.assertEqual(weights[:, :, 3:, :3].abs().max().item(), 0.0)
+
+            changed_ids = paddle.to_tensor([[7, 8, 9, 4, 5, 6]], dtype="int64")
+            changed = model(
+                input_ids=changed_ids,
+                position_ids=position_ids,
+                attn_mask_startend_row_indices=row_indices,
+                use_cache=False,
+            )
+            np.testing.assert_allclose(
+                changed.logits[:, 3:].numpy(), packed.logits[:, 3:].numpy(), atol=1e-5, rtol=1e-5
+            )
+            changed_ids = paddle.to_tensor([[1, 2, 7, 4, 5, 8]], dtype="int64")
+            changed = model(
+                input_ids=changed_ids,
+                position_ids=position_ids,
+                attn_mask_startend_row_indices=row_indices,
+                use_cache=False,
+            )
+            np.testing.assert_allclose(
+                changed.logits[:, [0, 1, 3, 4]].numpy(),
+                packed.logits[:, [0, 1, 3, 4]].numpy(),
+                atol=1e-5,
+                rtol=1e-5,
+            )
+
+    def test_sparse_mask_with_cache_matches_full_forward(self):
+        from paddleformers.transformers import (
+            Mistral3Config,
+            Mistral3ForConditionalGeneration,
+        )
+        from paddleformers.transformers.cache_utils import DynamicCache
+
+        model = Mistral3ForConditionalGeneration(
+            Mistral3Config(text_config=SMALL_GQA_CFG, vision_config=SMALL_VISION_CFG)
+        )
+        model.eval()
+        input_ids = paddle.to_tensor([[1, 2, 3, 4, 5, 6, 7, 8]], dtype="int64")
+        with paddle.no_grad():
+            expected = model(input_ids=input_ids, use_cache=False).logits
+            for bounds in (1, 2):
+                with self.subTest(bounds=bounds):
+                    cache = DynamicCache()
+                    for start, end in ((0, 3), (3, 4), (4, 6), (6, 8)):
+                        indices = paddle.full([1, 1, end + 2, bounds], end + 2, dtype="int32")
+                        output = model(
+                            input_ids=input_ids[:, start:end],
+                            past_key_values=cache,
+                            attn_mask_startend_row_indices=indices,
+                            use_cache=True,
+                        )
+                        self.assertEqual(cache.get_seq_length(), end)
+                        np.testing.assert_allclose(
+                            output.logits.numpy(), expected[:, start:end].numpy(), atol=1e-5, rtol=1e-5
+                        )
 
     def test_output_hidden_states_and_attentions(self):
         from paddleformers.transformers import (
